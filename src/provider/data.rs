@@ -738,7 +738,15 @@ static P_MAIL_RU: Provider = Provider {
             username_pattern: Email,
         },
     ],
-    opt: ProviderOptions::new(),
+    opt: ProviderOptions {
+        // mail.ru rejects the entire SMTP transaction with a permanent
+        // "too many recipients" error above 30 combined To/Cc/Bcc addresses.
+        // Keep a margin below that so the message still fits after `add_self_recipients()`
+        // adds the sender's own address(es) (BCC-self, possibly plus secondary self addrs).
+        // See <https://help.mail.ru/developers/mailing_rules/technical/>.
+        max_smtp_rcpt_to: Some(25),
+        ..ProviderOptions::new()
+    },
     config_defaults: None,
     oauth2_authorizer: None,
 };
