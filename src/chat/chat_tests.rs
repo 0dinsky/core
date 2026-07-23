@@ -6576,3 +6576,26 @@ async fn test_unpromoted_group_start_message() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_addr_domain_is_ip_literal() {
+    // Normal domains must not be flagged.
+    assert!(!addr_domain_is_ip_literal("alice@example.org"));
+    assert!(!addr_domain_is_ip_literal("alice@mail.ru"));
+    assert!(!addr_domain_is_ip_literal("alice@bk.ru"));
+    assert!(!addr_domain_is_ip_literal(
+        "mj8kxftibxbr@cm.project26.cc"
+    ));
+
+    // RFC 5321 general-address-literal form.
+    assert!(addr_domain_is_ip_literal("alice@[203.0.113.5]"));
+    assert!(addr_domain_is_ip_literal("alice@[IPv6:2001:db8::1]"));
+
+    // Bare IP address in place of a hostname.
+    assert!(addr_domain_is_ip_literal("alice@203.0.113.5"));
+    assert!(addr_domain_is_ip_literal("alice@2001:db8::1"));
+
+    // Malformed input must not panic and must be treated as "not an IP literal".
+    assert!(!addr_domain_is_ip_literal("not-an-email"));
+    assert!(!addr_domain_is_ip_literal(""));
+}

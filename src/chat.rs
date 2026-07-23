@@ -2817,6 +2817,22 @@ async fn render_mime_message_and_pre_message(
     }
 }
 
+/// Returns true if `addr`'s domain part is a raw IP-address literal —
+/// either the RFC 5321 general-address-literal form (`user@[203.0.113.5]`,
+/// `user@[IPv6:2001:db8::1]`) or a bare IP address used in place of a
+/// hostname (`user@203.0.113.5`) — rather than a normal domain name.
+fn addr_domain_is_ip_literal(addr: &str) -> bool {
+    let Some((_local, domain)) = addr.rsplit_once('@') else {
+        return false;
+    };
+    let domain = domain
+        .strip_prefix('[')
+        .and_then(|d| d.strip_suffix(']'))
+        .unwrap_or(domain);
+    let domain = domain.strip_prefix("IPv6:").unwrap_or(domain);
+    domain.parse::<std::net::IpAddr>().is_ok()
+}
+
 /// Constructs jobs for sending a message and inserts them into the `smtp` table.
 ///
 /// Updates the message `GuaranteeE2ee` parameter and persists it
@@ -2865,6 +2881,29 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
     let lowercase_from = from.to_lowercase();
 
     recipients.retain(|x| x.to_lowercase() != lowercase_from);
+
+    // mail.ru (and its aliases inbox.ru/internet.ru/bk.ru/list.ru, which all resolve to the
+    // same provider entry) does not reliably deliver to recipients whose domain is a raw
+    // IP-address literal (`user@[203.0.113.5]`, `user@203.0.113.5`) rather than a normal
+    // hostname. Drop such recipients up front when sending through a mail.ru account so one
+    // oddly-addressed member can't hold up or bounce the whole message/group send.
+    if let Some(provider) = context.get_configured_provider().await?
+        && provider.id == "mail.ru"
+    {
+        let mut kept = Vec::with_capacity(recipients.len());
+        for addr in recipients {
+            if addr_domain_is_ip_literal(&addr) {
+                warn!(
+                    context,
+                    "Skipping recipient {addr} for message {}: mail.ru does not reliably deliver to IP-literal domains.",
+                    msg.id
+                );
+            } else {
+                kept.push(addr);
+            }
+        }
+        recipients = kept;
+    }
 
     // Default Webxdc integrations are hidden messages and must not be sent out:
     if (msg.param.get_int(Param::WebxdcIntegration).is_some() && msg.hidden)
