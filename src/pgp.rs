@@ -108,7 +108,7 @@ pub(crate) fn create_pqc_keypair(addr: EmailAddress) -> Result<SignedSecretKey> 
 
     // Hybrid ML-KEM-768 + X25519 for encryption.
     // Classic receivers use the X25519 component; PQC-capable receivers use both.
-    let encryption_key_type = PgpKeyType::X25519MlKem768;
+    let encryption_key_type = PgpKeyType::MlKem768X25519;
 
     let key_params = SecretKeyParamsBuilder::default()
         .key_type(signing_key_type)
