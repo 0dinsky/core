@@ -525,8 +525,6 @@ impl MimeMessage {
             // let known protected headers from the decrypted
             // part override the unencrypted top-level
 
-            // Signature was checked for original From, so we
-            // do not allow overriding it.
             let mut inner_from = None;
 
             MimeMessage::merge_headers(
@@ -558,19 +556,22 @@ impl MimeMessage {
                     // This _might_ be because the sender's mail server
                     // replaced the sending address, e.g. in a mailing list.
                     // Or it's because someone is doing some replay attack.
-                    // Resending encrypted messages via mailing lists
-                    // without reencrypting is not useful anyway,
-                    // so we return an error below.
                     warn!(
                         context,
                         "From header in encrypted part doesn't match the outer one",
                     );
 
-                    // Return an error from the parser.
-                    // This will result in creating a tombstone
-                    // and no further message processing
-                    // as if the MIME structure is broken.
-                    bail!("From header is forged");
+                    // If there are no valid signatures,
+                    // possibly because we don't have the public key,
+                    // the message will be associated with the address-contact.
+                    // If the address is possibly forged, we trash the message.
+                    if signatures.is_empty() {
+                        // Return an error from the parser.
+                        // This will result in creating a tombstone
+                        // and no further message processing
+                        // as if the MIME structure is broken.
+                        bail!("From header is forged");
+                    }
                 }
                 from = inner_from;
             }
@@ -1737,6 +1738,10 @@ impl MimeMessage {
                 .extract_if(|k, _v| has_header_protection || is_protected(k))
                 .map(|(k, _v)| k.to_string()),
         );
+
+        if has_header_protection {
+            *chat_disposition_notification_to = None;
+        }
         for field in fields {
             // lowercasing all headers is technically not correct, but makes things work better
             let key = field.get_key().to_lowercase();
@@ -1753,20 +1758,20 @@ impl MimeMessage {
             }
         }
         let recipients_new = get_recipients(fields);
-        if !recipients_new.is_empty() {
+        if has_header_protection || !recipients_new.is_empty() {
             *recipients = recipients_new;
         }
         let past_members_addresses =
             get_all_addresses_from_header(fields, "chat-group-past-members");
-        if !past_members_addresses.is_empty() {
+        if has_header_protection || !past_members_addresses.is_empty() {
             *past_members = past_members_addresses;
         }
         let from_new = get_from(fields);
-        if from_new.is_some() {
+        if has_header_protection || from_new.is_some() {
             *from = from_new;
         }
         let list_post_new = get_list_post(fields);
-        if list_post_new.is_some() {
+        if has_header_protection || list_post_new.is_some() {
             *list_post = list_post_new;
         }
     }

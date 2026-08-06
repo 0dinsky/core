@@ -853,6 +853,7 @@ pub(crate) async fn login_param_from_account_qr(
             },
             smtp: Default::default(),
             certificate_checks: EnteredCertificateChecks::Strict,
+            oauth2: false,
         };
         return Ok(param);
     }
@@ -872,6 +873,7 @@ pub(crate) async fn login_param_from_account_qr(
             },
             smtp: Default::default(),
             certificate_checks: EnteredCertificateChecks::Strict,
+            oauth2: false,
         };
 
         Ok(param)
