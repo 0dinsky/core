@@ -21,6 +21,7 @@ use pgp::types::{CompressionAlgorithm, KeyDetails, KeyVersion};
 use rand_old::thread_rng;
 use tokio::runtime::Handle;
 
+use crate::config::Config;
 use crate::context::Context;
 use crate::events::EventType;
 use crate::log::LogExt;
@@ -479,9 +480,29 @@ async fn generate_keypair(context: &Context) -> Result<SignedSecretKey> {
         Some(key_pair) => Ok(key_pair),
         None => {
             let start = tools::Time::now();
-            info!(context, "Generating keypair.");
+
+            // Determine key generation mode:
+            //   0 (default) — Classic: Ed25519Legacy + Curve25519 (OpenPGP v4)
+            //   1           — Post-quantum hybrid: Ed25519 v6 + ML-KEM-768+X25519
+            let key_gen_mode = context.get_config_int(Config::KeyGenMode).await?;
+
+            if key_gen_mode == 1 {
+                info!(
+                    context,
+                    "Generating post-quantum keypair (v6 Ed25519 + ML-KEM-768+X25519)."
+                );
+            } else {
+                info!(context, "Generating classic keypair (Ed25519 + Curve25519).");
+            }
+
             let keypair = Handle::current()
-                .spawn_blocking(move || crate::pgp::create_keypair(addr))
+                .spawn_blocking(move || {
+                    if key_gen_mode == 1 {
+                        crate::pgp::create_pqc_keypair(addr)
+                    } else {
+                        crate::pgp::create_keypair(addr)
+                    }
+                })
                 .await??;
 
             store_self_keypair(context, &keypair).await?;

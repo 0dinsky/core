@@ -462,6 +462,44 @@ pub enum Config {
     /// and incoming unencrypted messages are not fetched and not processed.
     #[strum(props(default = "1"))]
     ForceEncryption,
+
+    /// Key generation mode.
+    ///
+    /// Controls which algorithm suite is used when a new keypair is generated.
+    ///
+    /// - `0` (default) — **Classic**: Ed25519Legacy + Curve25519 ECDH (OpenPGP v4).
+    ///   Maximum compatibility with all OpenPGP clients.
+    /// - `1` — **Post-quantum hybrid** (OpenPGP v6): Ed25519 primary key +
+    ///   ML-KEM-768+X25519 encryption subkey (draft-ietf-openpgp-pqc).
+    ///   Backward-compatible: classic clients fall back to the X25519 KEM component.
+    ///
+    /// **Changing this setting only affects the next key generation.**
+    /// Existing keys are not replaced automatically.
+    ///
+    /// # Perfect Forward Secrecy
+    ///
+    /// TLS-layer PFS is already guaranteed: Delta Chat uses TLS 1.3 (ephemeral
+    /// key exchange by design) and TLS 1.2 session resumption is disabled.
+    ///
+    /// OpenPGP-layer PFS is achieved by rotating the encryption subkey periodically
+    /// via `KeyRotationPeriod`.  After a subkey is rotated out, compromising the
+    /// current subkey does not expose messages encrypted to the old subkey.
+    #[strum(props(default = "0"))]
+    KeyGenMode,
+
+    /// Encryption subkey rotation period in days (0 = disabled).
+    ///
+    /// When non-zero, a fresh encryption subkey is generated and published every N
+    /// days.  Old subkeys remain in the keyring for decryption of past messages,
+    /// but the newest subkey is always used for outgoing encryption.
+    ///
+    /// This provides **partial forward secrecy** at the OpenPGP layer: compromise
+    /// of the current subkey does not expose messages encrypted to older,
+    /// already-rotated subkeys.
+    ///
+    /// Recommended values: 30–90 days.  Set to `0` to disable rotation (default).
+    #[strum(props(default = "0"))]
+    KeyRotationPeriod,
 }
 
 impl Config {

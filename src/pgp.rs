@@ -81,6 +81,79 @@ pub(crate) fn create_keypair(addr: EmailAddress) -> Result<SignedSecretKey> {
     Ok(secret_key)
 }
 
+/// Creates a post-quantum hybrid keypair (OpenPGP v6).
+///
+/// Uses hybrid algorithms from draft-ietf-openpgp-pqc:
+/// - **Signing** (primary key): Ed25519 v6 (non-legacy 32-byte format, algorithm 27)
+/// - **Encryption** (subkey): X25519 + ML-KEM-768 hybrid KEM (algorithm 0x1d)
+///
+/// # Backward compatibility
+///
+/// Peers that do **not** support PQC (classic OpenPGP clients) fall back to the
+/// X25519 component of the hybrid KEM and can still send encrypted messages.
+/// Decryption by the PQC key holder works in all cases.
+///
+/// PQC signatures protect against harvest-now/decrypt-later attacks on
+/// message authenticity; the hybrid KEM protects confidentiality against
+/// future quantum adversaries.
+///
+/// # Requirement
+///
+/// The `pgp` crate must be built with `features = ["draft-pqc"]`
+/// (already set in `Cargo.toml`).
+pub(crate) fn create_pqc_keypair(addr: EmailAddress) -> Result<SignedSecretKey> {
+    // v6 Ed25519 for signing — uses 32-byte key material, not the legacy 33-byte
+    // compressed-point format.  Classic receivers verify it fine.
+    let signing_key_type = PgpKeyType::Ed25519;
+
+    // Hybrid ML-KEM-768 + X25519 for encryption.
+    // Classic receivers use the X25519 component; PQC-capable receivers use both.
+    let encryption_key_type = PgpKeyType::X25519MlKem768;
+
+    let key_params = SecretKeyParamsBuilder::default()
+        .key_type(signing_key_type)
+        .can_certify(true)
+        .can_sign(true)
+        .feature_seipd_v2(true)
+        .primary_user_id(format!("<{addr}>"))
+        .passphrase(None)
+        .preferred_symmetric_algorithms(smallvec![
+            SymmetricKeyAlgorithm::AES256,
+            SymmetricKeyAlgorithm::AES192,
+            SymmetricKeyAlgorithm::AES128,
+        ])
+        .preferred_hash_algorithms(smallvec![
+            HashAlgorithm::Sha256,
+            HashAlgorithm::Sha384,
+            HashAlgorithm::Sha512,
+            HashAlgorithm::Sha224,
+        ])
+        .preferred_compression_algorithms(smallvec![
+            CompressionAlgorithm::ZLIB,
+            CompressionAlgorithm::ZIP,
+        ])
+        .subkey(
+            SubkeyParamsBuilder::default()
+                .key_type(encryption_key_type)
+                .can_encrypt(EncryptionCaps::All)
+                .passphrase(None)
+                .build()
+                .context("failed to build PQC subkey parameters")?,
+        )
+        .build()
+        .context("failed to build PQC key parameters")?;
+
+    let mut rng = thread_rng();
+    let secret_key = key_params
+        .generate(&mut rng)
+        .context("Failed to generate PQC keypair")?;
+    secret_key
+        .verify_bindings()
+        .context("Invalid PQC secret key generated")?;
+
+    Ok(secret_key)
+}
+
 /// Selects a subkey of the public key to use for encryption.
 ///
 /// Returns `None` if the public key cannot be used for encryption.
