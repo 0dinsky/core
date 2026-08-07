@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use anyhow::{Result, bail, ensure};
@@ -314,9 +314,13 @@ pub struct InnerContext {
     pub(crate) iroh: Arc<RwLock<Option<Iroh>>>,
 
     /// The own fingerprint, if it was computed already.
-    /// tokio::sync::OnceCell would be possible to use, but overkill for our usecase;
-    /// the standard library's OnceLock is enough, and it's a lot smaller in memory.
-    pub(crate) self_fingerprint: OnceLock<String>,
+    ///
+    /// This used to be a `std::sync::OnceLock`, which is smaller and faster,
+    /// but can only ever be set once — incompatible with `Config::KeyRotationPeriod`
+    /// changing the active key (and therefore the fingerprint) during the
+    /// lifetime of a `Context`. A `Mutex` lets [`crate::key::rotate_self_keypair`]
+    /// invalidate the cache on rotation, same as `self_public_key` below.
+    pub(crate) self_fingerprint: Mutex<Option<String>>,
 
     /// OpenPGP certificate aka Transferrable Public Key.
     ///
@@ -502,7 +506,7 @@ impl Context {
             tls_session_store: TlsSessionStore::new(),
             spki_hash_store: SpkiHashStore::new(),
             iroh: Arc::new(RwLock::new(None)),
-            self_fingerprint: OnceLock::new(),
+            self_fingerprint: Mutex::new(None),
             self_public_key: Mutex::new(None),
             connectivities: parking_lot::Mutex::new(Vec::new()),
         };

@@ -87,6 +87,11 @@ pub(crate) struct MimeMessage {
     /// Decryption error if decryption of the message has failed.
     pub decryption_error: Option<String>,
 
+    /// Which algorithm family (classic or post-quantum) of our own secret
+    /// key actually decrypted this message, if it was asymmetrically
+    /// OpenPGP-encrypted and this could be determined.
+    pub decryption_key_kind: Option<crate::pgp::EncryptionKind>,
+
     /// Valid signature fingerprint if a message is an
     /// Autocrypt encrypted and signed message and corresponding intended recipient fingerprints
     /// (<https://www.rfc-editor.org/rfc/rfc9580.html#name-intended-recipient-fingerpr>) if any.
@@ -353,9 +358,10 @@ impl MimeMessage {
         let mail_raw; // Memory location for a possible decrypted message.
         let decrypted_msg; // Decrypted signed OpenPGP message.
         let expected_sender_fingerprint: Option<String>;
+        let decryption_key_kind: Option<crate::pgp::EncryptionKind>;
 
         let (mail, is_encrypted) = match Box::pin(decrypt::decrypt(context, &mail)).await {
-            Ok(Some((mut msg, expected_sender_fp))) => {
+            Ok(Some((mut msg, expected_sender_fp, key_kind))) => {
                 mail_raw = msg.as_data_vec().unwrap_or_default();
 
                 let decrypted_mail = mailparse::parse_mail(&mail_raw)?;
@@ -383,18 +389,21 @@ impl MimeMessage {
                 }
 
                 expected_sender_fingerprint = expected_sender_fp;
+                decryption_key_kind = key_kind;
                 (Ok(decrypted_mail), true)
             }
             Ok(None) => {
                 mail_raw = Vec::new();
                 decrypted_msg = None;
                 expected_sender_fingerprint = None;
+                decryption_key_kind = None;
                 (Ok(mail), false)
             }
             Err(err) => {
                 mail_raw = Vec::new();
                 decrypted_msg = None;
                 expected_sender_fingerprint = None;
+                decryption_key_kind = None;
                 warn!(context, "decryption failed: {:#}", err);
                 (Err(err), false)
             }
@@ -641,6 +650,7 @@ impl MimeMessage {
             incoming,
             chat_disposition_notification_to,
             decryption_error: mail.err().map(|err| format!("{err:#}")),
+            decryption_key_kind,
 
             // only non-empty if it was a valid autocrypt message
             signature,
@@ -1626,6 +1636,10 @@ impl MimeMessage {
     pub(crate) fn do_add_single_part(&mut self, mut part: Part) {
         if self.was_encrypted() {
             part.param.set_int(Param::GuaranteeE2ee, 1);
+            if let Some(kind) = self.decryption_key_kind {
+                part.param
+                    .set(Param::DecryptionKeyKind, kind.as_param_str());
+            }
         }
         self.parts.push(part);
     }

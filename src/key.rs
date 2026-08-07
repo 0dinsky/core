@@ -355,12 +355,15 @@ pub(crate) async fn load_self_public_keyring(context: &Context) -> Result<Vec<Si
 /// If no key is generated yet, generates a new one.
 ///
 /// For performance reasons, the fingerprint is cached after the first invocation.
-pub(crate) async fn self_fingerprint(context: &Context) -> Result<&str> {
-    if let Some(fp) = context.self_fingerprint.get() {
-        Ok(fp)
+/// The cache is invalidated by [`rotate_self_keypair`] when the active key changes.
+pub(crate) async fn self_fingerprint(context: &Context) -> Result<String> {
+    let mut lock = context.self_fingerprint.lock().await;
+    if let Some(ref fp) = *lock {
+        Ok(fp.clone())
     } else {
         let fp = load_self_public_key(context).await?.dc_fingerprint().hex();
-        Ok(context.self_fingerprint.get_or_init(|| fp))
+        *lock = Some(fp.clone());
+        Ok(fp)
     }
 }
 
@@ -370,12 +373,15 @@ pub(crate) async fn self_fingerprint(context: &Context) -> Result<&str> {
 /// Returns `None` if no key is generated yet.
 ///
 /// For performance reasons, the fingerprint is cached after the first invocation.
-pub(crate) async fn self_fingerprint_opt(context: &Context) -> Result<Option<&str>> {
-    if let Some(fp) = context.self_fingerprint.get() {
-        Ok(Some(fp))
+/// The cache is invalidated by [`rotate_self_keypair`] when the active key changes.
+pub(crate) async fn self_fingerprint_opt(context: &Context) -> Result<Option<String>> {
+    let mut lock = context.self_fingerprint.lock().await;
+    if let Some(ref fp) = *lock {
+        Ok(Some(fp.clone()))
     } else if let Some(key) = load_self_public_key_opt(context).await? {
         let fp = key.dc_fingerprint().hex();
-        Ok(Some(context.self_fingerprint.get_or_init(|| fp)))
+        *lock = Some(fp.clone());
+        Ok(Some(fp))
     } else {
         Ok(None)
     }
@@ -568,9 +574,9 @@ pub(crate) async fn store_self_keypair(
             // so this fails if we already have this key.
             transaction
                 .execute(
-                    "INSERT INTO keypairs (public_key, private_key)
-                     VALUES (?,?)",
-                    (&public_key, &secret_key),
+                    "INSERT INTO keypairs (public_key, private_key, created)
+                     VALUES (?,?,?)",
+                    (&public_key, &secret_key, tools::time()),
                 )
                 .context("Failed to insert keypair")?;
 
@@ -600,6 +606,144 @@ pub(crate) async fn store_self_keypair(
 pub async fn preconfigure_keypair(context: &Context, secret_data: &str) -> Result<()> {
     let secret = SignedSecretKey::from_asc(secret_data)?;
     store_self_keypair(context, &secret).await?;
+    Ok(())
+}
+
+/// How long, in days, to keep the secret material of a rotated-out key
+/// around after it stops being the active key, before erasing it for good.
+///
+/// This grace period exists so that messages already in flight (e.g. stuck
+/// on a slow relay, or sent by a contact who hasn't fetched our latest
+/// Autocrypt header yet) can still be decrypted. Once the grace period is
+/// over, the old secret key is permanently deleted: this is the step that
+/// actually buys forward secrecy, since after that point, not even we can
+/// decrypt what was encrypted to that key anymore.
+const KEY_ROTATION_GRACE_DAYS: i64 = 3;
+
+/// If `Config::KeyRotationPeriod` is set and our current key is older than
+/// that many days, generates a fresh keypair (same generation mode as the
+/// current key — classic or post-quantum) and makes it the active key.
+/// Also permanently erases any previously-rotated-out key whose grace
+/// period has elapsed, regardless of whether rotation is currently enabled
+/// (so turning rotation off does not leave old keys lying around forever).
+///
+/// ## Caveat: this rotates the whole keypair, not just the encryption subkey
+///
+/// Ideally only the encryption subkey would be rotated, keeping the signing
+/// primary key (and therefore the fingerprint) stable, so that contacts who
+/// have "Verified" this fingerprint wouldn't need to re-verify after every
+/// rotation. The OpenPGP library used here (rPGP 0.20) has no supported API
+/// to bind a freshly generated subkey to an *existing* primary key, only to
+/// generate a whole new keypair from scratch — so that's what this does.
+/// Practically: a rotation changes the fingerprint, and contacts will see
+/// "unverified" until they re-verify, the same as if the user had manually
+/// reset their key. Peers still get the new key automatically via the
+/// Autocrypt header on the next message either way.
+pub(crate) async fn maybe_rotate_keypair(context: &Context) -> Result<()> {
+    let now = tools::time();
+
+    let period_days = context.get_config_int(Config::KeyRotationPeriod).await?;
+    if period_days > 0 {
+        let current_key_created: Option<i64> = context
+            .sql
+            .query_row_optional(
+                "SELECT created FROM keypairs
+                 WHERE id=(SELECT value FROM config WHERE keyname='key_id')",
+                (),
+                |row| row.get(0),
+            )
+            .await?;
+
+        // A `created` of 0 means this key predates the column being
+        // populated; treat that the same as "just generated" rather than
+        // "infinitely old" so we don't force an immediate rotation on
+        // every existing account the first time this code runs.
+        let age_days = match current_key_created {
+            Some(created) if created > 0 => (now - created) / 86_400,
+            _ => 0,
+        };
+
+        if age_days >= i64::from(period_days) {
+            let key_gen_mode = context.get_config_int(Config::KeyGenMode).await?;
+            info!(
+                context,
+                "Rotating self key (age {age_days} days >= configured period {period_days} days)."
+            );
+            let addr = context.get_primary_self_addr().await?;
+            let addr = EmailAddress::new(&addr)?;
+            let new_key = Handle::current()
+                .spawn_blocking(move || {
+                    if key_gen_mode == 1 {
+                        crate::pgp::create_pqc_keypair(addr)
+                    } else {
+                        crate::pgp::create_keypair(addr)
+                    }
+                })
+                .await??;
+            rotate_self_keypair(context, &new_key).await?;
+        }
+    }
+
+    // Erase secret material of any rotated-out key that is past its grace
+    // period, whether or not rotation is currently enabled.
+    let cutoff = now - KEY_ROTATION_GRACE_DAYS * 86_400;
+    let deleted = context
+        .sql
+        .execute(
+            "DELETE FROM keypairs
+             WHERE id != (SELECT value FROM config WHERE keyname='key_id')
+               AND created > 0
+               AND created < ?",
+            (cutoff,),
+        )
+        .await?;
+    if deleted > 0 {
+        info!(
+            context,
+            "Erased {deleted} rotated-out keypair(s) past their grace period."
+        );
+    }
+
+    Ok(())
+}
+
+/// Makes `new_key` the active self key, keeping the previously active key
+/// in the `keypairs` table (still usable for decryption) until
+/// [`maybe_rotate_keypair`] erases it after its grace period.
+async fn rotate_self_keypair(context: &Context, new_key: &SignedSecretKey) -> Result<()> {
+    let signed_public_key = new_key.to_public_key();
+    let mut config_cache_lock = context.sql.config_cache.write().await;
+    let new_key_id = context
+        .sql
+        .transaction(|transaction| {
+            let public_key = DcKey::to_bytes(&signed_public_key);
+            let secret_key = DcKey::to_bytes(new_key);
+
+            transaction
+                .execute(
+                    "INSERT INTO keypairs (public_key, private_key, created)
+                     VALUES (?,?,?)",
+                    (&public_key, &secret_key, tools::time()),
+                )
+                .context("Failed to insert rotated keypair")?;
+            let new_key_id = transaction.last_insert_rowid();
+
+            transaction.execute(
+                "UPDATE config SET value=? WHERE keyname='key_id'",
+                (new_key_id,),
+            )?;
+            Ok(new_key_id)
+        })
+        .await?;
+    // Invalidate the cached public key / fingerprint so that the new key is
+    // picked up immediately (e.g. in the very next Autocrypt header we send),
+    // rather than only after the next process restart. Both caches are
+    // lazily repopulated from the DB (via `key_id`, which we just updated)
+    // on next access.
+    *context.self_public_key.lock().await = None;
+    *context.self_fingerprint.lock().await = None;
+    context.emit_event(EventType::AccountsItemChanged);
+    config_cache_lock.insert("key_id".to_string(), Some(new_key_id.to_string()));
     Ok(())
 }
 

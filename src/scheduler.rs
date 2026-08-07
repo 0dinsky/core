@@ -18,6 +18,7 @@ use crate::download::{download_known_post_messages_without_pre_message, download
 use crate::ephemeral;
 use crate::events::EventType;
 use crate::imap::{Imap, session::Session};
+use crate::key;
 use crate::location;
 use crate::log::{LogExt, warn};
 use crate::smtp::{Smtp, send_smtp_messages};
@@ -438,6 +439,7 @@ async fn inbox_fetch_idle(ctx: &Context, imap: &mut Imap, mut session: Session) 
                 last_housekeeping_time.saturating_add(constants::HOUSEKEEPING_PERIOD);
             if next_housekeeping_time <= time() {
                 sql::housekeeping(ctx).await.log_err(ctx).ok();
+                key::maybe_rotate_keypair(ctx).await.log_err(ctx).ok();
             }
         }
         Err(err) => {

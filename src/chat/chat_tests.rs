@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use super::*;
 use crate::Event;
 use crate::chatlist::get_archived_cnt;
@@ -4074,15 +4072,14 @@ async fn test_only_broadcast_owner_can_send_2() -> Result<()> {
 
     alice.sql.execute("DELETE FROM keypairs", ()).await?;
     *alice.self_public_key.lock().await = None;
+    // Invalidate cached self fingerprint too — now a Mutex (like self_public_key
+    // above) so key rotation can clear it too, without needing exclusive
+    // (`Arc::get_mut`) access as a plain OnceLock would have required.
+    *alice.self_fingerprint.lock().await = None;
     alice
         .sql
         .execute("DELETE FROM config WHERE keyname='key_id'", ())
         .await?;
-    // Invalidate cached self fingerprint:
-    Arc::get_mut(&mut alice.ctx.inner)
-        .unwrap()
-        .self_fingerprint
-        .take();
 
     tcm.section("Alice sends a message, which is trashed");
     let sent = alice.send_text(alice_broadcast_id, "Hi").await;

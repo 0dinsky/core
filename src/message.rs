@@ -286,6 +286,15 @@ SELECT ?1, rfc724_mid, pre_rfc724_mid, timestamp, ?, ? FROM msgs WHERE id=?1
 
         if 0 != msg.param.get_int(Param::GuaranteeE2ee).unwrap_or_default() {
             ret += ", Encrypted";
+            if let Some(kind) = msg
+                .param
+                .get(Param::DecryptionKeyKind)
+                .and_then(crate::pgp::EncryptionKind::from_param_str)
+            {
+                ret += " (";
+                ret += kind.label();
+                ret += ")";
+            }
         }
 
         ret += "\n";

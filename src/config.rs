@@ -481,21 +481,29 @@ pub enum Config {
     /// TLS-layer PFS is already guaranteed: Delta Chat uses TLS 1.3 (ephemeral
     /// key exchange by design) and TLS 1.2 session resumption is disabled.
     ///
-    /// OpenPGP-layer PFS is achieved by rotating the encryption subkey periodically
-    /// via `KeyRotationPeriod`.  After a subkey is rotated out, compromising the
-    /// current subkey does not expose messages encrypted to the old subkey.
+    /// OpenPGP-layer PFS is achieved by rotating the whole keypair periodically
+    /// via `KeyRotationPeriod`, and permanently erasing each rotated-out key's
+    /// secret material a few days later. After that erasure, compromising the
+    /// current key does not expose messages encrypted to the old, deleted key
+    /// — because that key simply no longer exists anywhere.
     #[strum(props(default = "0"))]
     KeyGenMode,
 
-    /// Encryption subkey rotation period in days (0 = disabled).
+    /// Keypair rotation period in days (0 = disabled).
     ///
-    /// When non-zero, a fresh encryption subkey is generated and published every N
-    /// days.  Old subkeys remain in the keyring for decryption of past messages,
-    /// but the newest subkey is always used for outgoing encryption.
+    /// When non-zero, a fresh keypair is generated and made active every N
+    /// days. The rotated-out key's secret material is kept for a few more
+    /// days (to decrypt messages still in flight), then permanently erased.
     ///
-    /// This provides **partial forward secrecy** at the OpenPGP layer: compromise
-    /// of the current subkey does not expose messages encrypted to older,
-    /// already-rotated subkeys.
+    /// This provides **partial forward secrecy** at the OpenPGP layer:
+    /// compromise of the current key does not expose messages encrypted to
+    /// older, already-erased keys.
+    ///
+    /// Caveat: this rotates the *whole* keypair (signing + encryption), not
+    /// just the encryption subkey, so the fingerprint changes on every
+    /// rotation — contacts who "Verified" this account will need to
+    /// re-verify afterwards. Peers still pick up the new key automatically
+    /// via the Autocrypt header on the next message either way.
     ///
     /// Recommended values: 30–90 days.  Set to `0` to disable rotation (default).
     #[strum(props(default = "0"))]

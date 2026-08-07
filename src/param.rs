@@ -266,6 +266,12 @@ pub enum Param {
 
     /// For (pre-)Message: File byte size of Post-Message attachment
     PostMessageFileBytes = b'9',
+
+    /// For incoming Messages: which algorithm family of our own secret key
+    /// actually decrypted this message ("classic" or "pq"), if it was
+    /// asymmetrically OpenPGP-encrypted and this could be determined.
+    /// Not set for outgoing, unencrypted, or symmetrically-encrypted messages.
+    DecryptionKeyKind = b'X',
 }
 
 /// An object for handling key=value parameter lists.
