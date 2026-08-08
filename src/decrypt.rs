@@ -8,7 +8,6 @@ use anyhow::{Context as _, Result, bail};
 use mailparse::ParsedMail;
 use pgp::composed::DecryptionOptions;
 use pgp::composed::Esk;
-use pgp::composed::InnerRingResult;
 use pgp::composed::Message;
 use pgp::composed::PlainSessionKey;
 use pgp::composed::SignedSecretKey;
@@ -25,21 +24,16 @@ use crate::contact::ContactId;
 use crate::context::Context;
 use crate::key::self_fingerprint;
 use crate::key::{Fingerprint, SignedPublicKey, load_self_secret_keyring};
-use crate::pgp::EncryptionKind;
 use crate::token::Namespace;
 
 /// Tries to decrypt the message,
-/// returning a tuple of `(decrypted message, fingerprint, decryption key kind)`.
+/// returning a tuple of `(decrypted message, fingerprint)`.
 ///
 /// If the message wasn't encrypted, returns `Ok(None)`.
 ///
-/// If the message was asymmetrically encrypted, `fingerprint` is `None` and
-/// `decryption key kind` tells whether the specific secret key that actually
-/// decrypted this message was our classic or post-quantum key (`None` if for
-/// some reason it could not be determined).
+/// If the message was asymmetrically encrypted, returns `Ok((decrypted message, None))`.
 ///
-/// If the message was symmetrically encrypted, returns
-/// `Ok((decrypted message, Some(fingerprint), None))`,
+/// If the message was symmetrically encrypted, returns `Ok((decrypted message, Some(fingerprint)))`,
 /// where `fingerprint` denotes which contact is allowed to send encrypted with this symmetric secret.
 /// If the message is not signed by `fingerprint`, it must be dropped.
 ///
@@ -50,7 +44,7 @@ use crate::token::Namespace;
 pub(crate) async fn decrypt(
     context: &Context,
     mail: &mailparse::ParsedMail<'_>,
-) -> Result<Option<(Message<'static>, Option<String>, Option<EncryptionKind>)>> {
+) -> Result<Option<(Message<'static>, Option<String>)>> {
     // `pgp::composed::Message` is huge (>4kb), so, make sure that it is in a Box when held over an await point
     let Some(msg) = get_encrypted_pgp_message_boxed(mail)? else {
         return Ok(None);
@@ -66,7 +60,7 @@ pub(crate) async fn decrypt(
     let decrypt_options =
         DecryptionOptions::new().set_seipdv1_read_mode(Seipdv1ReadMode::Streaming);
 
-    let (plain, decryption_key_kind) = if let Message::Encrypted { esk, .. } = &*msg
+    let plain = if let Message::Encrypted { esk, .. } = &*msg
         // We only allow one ESK for symmetrically encrypted messages
         // to avoid dealing with messages that are encrypted to multiple symmetric keys
         // or a mix of symmetric and asymmetric keys:
@@ -78,7 +72,7 @@ pub(crate) async fn decrypt(
             .context("decrypt_session_key_symmetrically")?;
         expected_sender_fingerprint = fingerprint;
 
-        let plain = tokio::task::spawn_blocking(move || -> Result<Message<'_>> {
+        tokio::task::spawn_blocking(move || -> Result<Message<'_>> {
             let ring = TheRing {
                 session_keys: vec![psk],
                 decrypt_options,
@@ -92,44 +86,30 @@ pub(crate) async fn decrypt(
             let plain: Message<'static> = plain.decompress()?;
             Ok(plain)
         })
-        .await??;
-        // Symmetric (broadcast-channel) encryption does not go through one of
-        // our asymmetric keys, so classic-vs-PQC does not apply here.
-        (plain, None)
+        .await??
     } else {
         // Message is asymmetrically encrypted
         let secret_keys: Vec<SignedSecretKey> = load_self_secret_keyring(context).await?;
         expected_sender_fingerprint = None;
 
-        tokio::task::spawn_blocking(move || -> Result<(Message<'_>, Option<EncryptionKind>)> {
-            let secret_key_refs: Vec<&SignedSecretKey> = secret_keys.iter().collect();
+        tokio::task::spawn_blocking(move || -> Result<Message<'_>> {
+            let secret_keys: Vec<&SignedSecretKey> = secret_keys.iter().collect();
             let ring = TheRing {
-                secret_keys: secret_key_refs,
+                secret_keys,
                 decrypt_options,
                 ..Default::default()
             };
-            let (plain, ring_result) = msg
+            let (plain, _ring_result) = msg
                 .decrypt_the_ring(ring, abort_early)
                 .context("decrypt_the_ring")?;
 
-            // Find which of our own secret keys (there may be several, from
-            // key rotation / PQC upgrade) actually decrypted the session key,
-            // and classify its algorithm so callers can tell whether this
-            // particular message came in via classic or post-quantum crypto.
-            let decryption_key_kind = ring_result
-                .secret_keys
-                .iter()
-                .position(|res| *res == InnerRingResult::Ok)
-                .and_then(|idx| secret_keys.get(idx))
-                .and_then(crate::pgp::encryption_kind_secret);
-
             let plain: Message<'static> = plain.decompress()?;
-            Ok((plain, decryption_key_kind))
+            Ok(plain)
         })
         .await??
     };
 
-    Ok(Some((plain, expected_sender_fingerprint, decryption_key_kind)))
+    Ok(Some((plain, expected_sender_fingerprint)))
 }
 
 async fn decrypt_session_key_symmetrically(
@@ -158,7 +138,7 @@ async fn decrypt_session_key_symmetrically(
             // Finally, try decrypting using own AUTH tokens
             // There can be a lot of AUTH tokens,
             // because a new one is generated every time a QR code is shown
-            let res: Option<PlainSessionKey> = try_decrypt_with_auth_token(esk, conn, &self_fp)?;
+            let res: Option<PlainSessionKey> = try_decrypt_with_auth_token(esk, conn, self_fp)?;
             if let Some(plain_session_key) = res {
                 return Ok((plain_session_key, None));
             }

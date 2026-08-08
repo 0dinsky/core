@@ -1439,21 +1439,13 @@ WHERE addr=?
             );
         }
 
-        if let Some(public_key) = contact.public_key(context).await? {
-            if let Some(kind) = crate::pgp::encryption_kind(&public_key) {
-                ret += "\n\nEncryption: ";
-                ret += kind.label();
-                ret += " — this is what will be used for messages sent to ";
-                ret += contact.get_display_name();
-                ret += ". It depends on their key, not on your own settings.";
-            }
-
-            if let Some(relay_addrs) = addresses_from_public_key(&public_key) {
-                ret += "\n\nRelays:";
-                for relay in &relay_addrs {
-                    ret += "\n";
-                    ret += relay;
-                }
+        if let Some(public_key) = contact.public_key(context).await?
+            && let Some(relay_addrs) = addresses_from_public_key(&public_key)
+        {
+            ret += "\n\nRelays:";
+            for relay in &relay_addrs {
+                ret += "\n";
+                ret += relay;
             }
         }
 

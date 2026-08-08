@@ -81,79 +81,6 @@ pub(crate) fn create_keypair(addr: EmailAddress) -> Result<SignedSecretKey> {
     Ok(secret_key)
 }
 
-/// Creates a post-quantum hybrid keypair (OpenPGP v6).
-///
-/// Uses hybrid algorithms from draft-ietf-openpgp-pqc:
-/// - **Signing** (primary key): Ed25519 v6 (non-legacy 32-byte format, algorithm 27)
-/// - **Encryption** (subkey): X25519 + ML-KEM-768 hybrid KEM (algorithm 0x1d)
-///
-/// # Backward compatibility
-///
-/// Peers that do **not** support PQC (classic OpenPGP clients) fall back to the
-/// X25519 component of the hybrid KEM and can still send encrypted messages.
-/// Decryption by the PQC key holder works in all cases.
-///
-/// PQC signatures protect against harvest-now/decrypt-later attacks on
-/// message authenticity; the hybrid KEM protects confidentiality against
-/// future quantum adversaries.
-///
-/// # Requirement
-///
-/// The `pgp` crate must be built with `features = ["draft-pqc"]`
-/// (already set in `Cargo.toml`).
-pub(crate) fn create_pqc_keypair(addr: EmailAddress) -> Result<SignedSecretKey> {
-    // v6 Ed25519 for signing — uses 32-byte key material, not the legacy 33-byte
-    // compressed-point format.  Classic receivers verify it fine.
-    let signing_key_type = PgpKeyType::Ed25519;
-
-    // Hybrid ML-KEM-768 + X25519 for encryption.
-    // Classic receivers use the X25519 component; PQC-capable receivers use both.
-    let encryption_key_type = PgpKeyType::MlKem768X25519;
-
-    let key_params = SecretKeyParamsBuilder::default()
-        .key_type(signing_key_type)
-        .can_certify(true)
-        .can_sign(true)
-        .feature_seipd_v2(true)
-        .primary_user_id(format!("<{addr}>"))
-        .passphrase(None)
-        .preferred_symmetric_algorithms(smallvec![
-            SymmetricKeyAlgorithm::AES256,
-            SymmetricKeyAlgorithm::AES192,
-            SymmetricKeyAlgorithm::AES128,
-        ])
-        .preferred_hash_algorithms(smallvec![
-            HashAlgorithm::Sha256,
-            HashAlgorithm::Sha384,
-            HashAlgorithm::Sha512,
-            HashAlgorithm::Sha224,
-        ])
-        .preferred_compression_algorithms(smallvec![
-            CompressionAlgorithm::ZLIB,
-            CompressionAlgorithm::ZIP,
-        ])
-        .subkey(
-            SubkeyParamsBuilder::default()
-                .key_type(encryption_key_type)
-                .can_encrypt(EncryptionCaps::All)
-                .passphrase(None)
-                .build()
-                .context("failed to build PQC subkey parameters")?,
-        )
-        .build()
-        .context("failed to build PQC key parameters")?;
-
-    let mut rng = thread_rng();
-    let secret_key = key_params
-        .generate(&mut rng)
-        .context("Failed to generate PQC keypair")?;
-    secret_key
-        .verify_bindings()
-        .context("Invalid PQC secret key generated")?;
-
-    Ok(secret_key)
-}
-
 /// Selects a subkey of the public key to use for encryption.
 ///
 /// Returns `None` if the public key cannot be used for encryption.
@@ -163,73 +90,6 @@ fn select_pk_for_encryption(key: &SignedPublicKey) -> Option<&SignedPublicSubKey
     key.public_subkeys
         .iter()
         .find(|subkey| subkey.algorithm().can_encrypt())
-}
-
-/// Coarse classification of the algorithm family behind a key's chosen
-/// encryption subkey, for display to the user (e.g. in message/contact info).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EncryptionKind {
-    /// Classic elliptic-curve encryption (ECDH / X25519).
-    Classic,
-    /// Post-quantum hybrid encryption (ML-KEM-768 + X25519 or ML-KEM-1024 + X448,
-    /// per draft-ietf-openpgp-pqc).
-    PostQuantum,
-}
-
-impl EncryptionKind {
-    /// Human-readable label.
-    pub fn label(self) -> &'static str {
-        match self {
-            EncryptionKind::Classic => "Classic (ECDH/X25519)",
-            EncryptionKind::PostQuantum => "Post-quantum (ML-KEM-768+X25519)",
-        }
-    }
-
-    /// Stable short identifier used to persist this in [`crate::param::Param`].
-    pub fn as_param_str(self) -> &'static str {
-        match self {
-            EncryptionKind::Classic => "classic",
-            EncryptionKind::PostQuantum => "pq",
-        }
-    }
-
-    /// Inverse of [`EncryptionKind::as_param_str`].
-    pub fn from_param_str(s: &str) -> Option<Self> {
-        match s {
-            "classic" => Some(EncryptionKind::Classic),
-            "pq" => Some(EncryptionKind::PostQuantum),
-            _ => None,
-        }
-    }
-}
-
-fn classify_encryption_algorithm(
-    algo: pgp::crypto::public_key::PublicKeyAlgorithm,
-) -> EncryptionKind {
-    use pgp::crypto::public_key::PublicKeyAlgorithm;
-    match algo {
-        PublicKeyAlgorithm::MlKem768X25519 | PublicKeyAlgorithm::MlKem1024X448 => {
-            EncryptionKind::PostQuantum
-        }
-        _ => EncryptionKind::Classic,
-    }
-}
-
-/// Returns the algorithm family of the encryption subkey that [`pk_encrypt`]
-/// would pick for this public key (i.e. what you'd use to encrypt *to* this key),
-/// or `None` if the key has no usable encryption subkey.
-pub fn encryption_kind(key: &SignedPublicKey) -> Option<EncryptionKind> {
-    select_pk_for_encryption(key).map(|subkey| classify_encryption_algorithm(subkey.algorithm()))
-}
-
-/// Same as [`encryption_kind`], but for one of our own secret keys — used to
-/// classify which algorithm decrypted an incoming message once we know which
-/// secret key succeeded.
-pub fn encryption_kind_secret(key: &SignedSecretKey) -> Option<EncryptionKind> {
-    key.public_subkeys
-        .iter()
-        .find(|subkey| subkey.algorithm().can_encrypt())
-        .map(|subkey| classify_encryption_algorithm(subkey.algorithm()))
 }
 
 /// Version of SEIPD packet to use.
@@ -653,7 +513,7 @@ mod tests {
         let mime_message = wrap_encrypted_part(bytes.try_into().unwrap());
         let rendered = render_outer_message(vec![], mime_message);
         let parsed = mailparse::parse_mail(rendered.as_bytes())?;
-        let (decrypted, _fp, _key_kind) = decrypt::decrypt(t, &parsed).await?.unwrap();
+        let (decrypted, _fp) = decrypt::decrypt(t, &parsed).await?.unwrap();
         Ok(decrypted)
     }
 

@@ -5,7 +5,6 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, ensure};
-use deltachat_contact_tools::EmailAddress;
 use deltachat_contact_tools::addr_cmp;
 use pgp::composed::SignedPublicKey;
 use rusqlite::OptionalExtension;
@@ -15,7 +14,7 @@ use crate::configure::EnteredLoginParam;
 use crate::context::Context;
 use crate::key::DcKey;
 use crate::log::warn;
-use crate::provider::get_provider_info;
+
 use crate::sql::Sql;
 use crate::tools::{self, Time, inc_and_check, time_elapsed};
 use crate::transport::ConfiguredLoginParam;
@@ -1118,22 +1117,7 @@ UPDATE chats SET protected=1, type=120 WHERE type=130;"#,
         .await?;
     }
 
-    if dbversion < 71 {
-        if let Ok(addr) = context.get_primary_self_addr().await {
-            if let Ok(domain) = EmailAddress::new(&addr).map(|email| email.domain) {
-                context
-                    .set_config_internal(
-                        Config::ConfiguredProvider,
-                        get_provider_info(&domain).map(|provider| provider.id),
-                    )
-                    .await?;
-            } else {
-                warn!(context, "Can't parse configured address: {:?}", addr);
-            }
-        }
-
-        sql.set_db_version(71).await?;
-    }
+    // Migration 71 was removed together with the provider database it read from.
     if dbversion < 72 && !sql.col_exists("msgs", "mime_modified").await? {
         sql.execute_migration(
             r#"
@@ -2517,6 +2501,20 @@ UPDATE msgs SET state=24 WHERE state=18; -- Change OutPreparing to OutFailed.
                 PRIMARY KEY(rfc724_mid, contact_id),
                 FOREIGN KEY(contact_id) REFERENCES contacts(id) ON DELETE CASCADE
             ) STRICT",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 159)?;
+    if dbversion < migration_version {
+        // Core 2.56.0 stored login parameters without the `oauth2` field,
+        // but older cores require it when deserializing.
+        // Set it to false as OAuth2 is not supported anymore.
+        sql.execute_migration(
+            "UPDATE transports
+             SET entered_param=json_set(entered_param, '$.oauth2', json('false')),
+                 configured_param=json_set(configured_param, '$.oauth2', json('false'))",
             migration_version,
         )
         .await?;
