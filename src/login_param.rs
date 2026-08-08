@@ -37,9 +37,8 @@ use crate::tools::ToOption;
 #[repr(u32)]
 #[strum(serialize_all = "snake_case")]
 pub enum EnteredCertificateChecks {
-    /// `Automatic` means that provider database setting should be taken.
-    /// If there is no provider database setting for certificate checks,
-    /// check certificates strictly.
+    /// `Automatic` means strict certificate checks,
+    /// unless a legacy-domain override disables them.
     #[default]
     Automatic = 0,
 
@@ -141,6 +140,10 @@ pub struct EnteredLoginParam {
     /// TLS options: whether to allow invalid certificates and/or
     /// invalid hostnames
     pub certificate_checks: EnteredCertificateChecks,
+
+    /// Deprecated 2026-07, always false
+    #[serde(default)]
+    pub oauth2: bool,
 }
 
 impl EnteredLoginParam {
@@ -236,6 +239,7 @@ impl EnteredLoginParam {
                 password: send_pw,
             },
             certificate_checks,
+            oauth2: false,
         })
     }
 
@@ -397,6 +401,7 @@ mod tests {
                 password: "".to_string(),
             },
             certificate_checks: Default::default(),
+            oauth2: false,
         };
         param.save_legacy(&t).await?;
         assert_eq!(
