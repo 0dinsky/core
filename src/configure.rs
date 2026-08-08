@@ -1,9 +1,11 @@
 //! # Email accounts autoconfiguration process.
 //!
-//! The module provides automatic lookup of configuration for email providers
-//! using [Mozilla Thunderbird Autoconfiguration protocol]
+//! The module provides automatic lookup of configuration
+//! for email providers based on the built-in [provider database],
+//! [Mozilla Thunderbird Autoconfiguration protocol]
 //! and [Outlook's Autodiscover].
 //!
+//! [provider database]: crate::provider
 //! [Mozilla Thunderbird Autoconfiguration protocol]: auto_mozilla
 //! [Outlook's Autodiscover]: auto_outlook
 
@@ -28,17 +30,19 @@ use crate::imap::Imap;
 use crate::log::warn;
 pub use crate::login_param::EnteredLoginParam;
 use crate::login_param::{EnteredCertificateChecks, TransportListEntry};
+use crate::message::Message;
 use crate::net::proxy::ProxyConfig;
-use crate::provider::{self, Protocol, Socket};
+use crate::provider::{Protocol, Provider, Socket, UsernamePattern};
 use crate::qr::{login_param_from_account_qr, login_param_from_login_qr};
 use crate::smtp::Smtp;
-use crate::sync::Sync::Nosync;
+use crate::sync::Sync::*;
 use crate::tools::time;
 use crate::transport::{
     ConfiguredCertificateChecks, ConfiguredLoginParam, ConfiguredServerLoginParam,
     ConnectionCandidate, send_sync_transports,
 };
 use crate::{EventType, stock_str};
+use crate::{chat, provider};
 
 /// Maximum number of relays.
 ///
@@ -335,27 +339,25 @@ impl Context {
             self.try_make_space_for_new_relay().await?;
         }
 
-        if let Err(error) = configure(self, param).await {
-            // Log entered and actual params
-            let configured_param = get_configured_param(self, param).await;
-            warn!(
-                self,
-                "configure failed: Entered params: {}. Used params: {}. Error: {error}.",
-                param.to_string(),
-                configured_param
-                    .map(|param| param.to_string())
-                    .unwrap_or("error".to_owned())
-            );
-            return Err(error);
+        let provider = match configure(self, param).await {
+            Err(error) => {
+                // Log entered and actual params
+                let configured_param = get_configured_param(self, param).await;
+                warn!(
+                    self,
+                    "configure failed: Entered params: {}. Used params: {}. Error: {error}.",
+                    param.to_string(),
+                    configured_param
+                        .map(|param| param.to_string())
+                        .unwrap_or("error".to_owned())
+                );
+                return Err(error);
+            }
+            Ok(provider) => provider,
         };
         self.set_config_internal(Config::NotifyAboutWrongPw, Some("1"))
             .await?;
-        if provider::legacy_settings_for_addr(&param.addr)?.worse_media_quality
-            && !self.config_exists(Config::MediaQuality).await?
-        {
-            self.set_config_ex(Nosync, Config::MediaQuality, Some("1"))
-                .await?;
-        }
+        on_configure_completed(self, provider).await?;
         Ok(())
     }
 
@@ -396,7 +398,42 @@ impl Context {
     }
 }
 
-/// Retrieves data from autoconfig
+async fn on_configure_completed(
+    context: &Context,
+    provider: Option<&'static Provider>,
+) -> Result<()> {
+    if let Some(provider) = provider {
+        if let Some(config_defaults) = provider.config_defaults {
+            for def in config_defaults {
+                if !context.config_exists(def.key).await? {
+                    info!(context, "apply config_defaults {}={}", def.key, def.value);
+                    context
+                        .set_config_ex(Nosync, def.key, Some(def.value))
+                        .await?;
+                } else {
+                    info!(
+                        context,
+                        "skip already set config_defaults {}={}", def.key, def.value
+                    );
+                }
+            }
+        }
+
+        if !provider.after_login_hint.is_empty() {
+            let mut msg = Message::new_text(provider.after_login_hint.to_string());
+            if chat::add_device_msg(context, Some("core-provider-info"), Some(&mut msg))
+                .await
+                .is_err()
+            {
+                warn!(context, "cannot add after_login_hint as core-provider-info");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Retrieves data from autoconfig and provider database
 /// to transform user-entered login parameters into complete configuration.
 async fn get_configured_param(
     ctx: &Context,
@@ -420,7 +457,9 @@ async fn get_configured_param(
 
     progress!(ctx, 200);
 
-    let param_autoconfig = if param.imap.server.is_empty()
+    let provider;
+    let param_autoconfig;
+    if param.imap.server.is_empty()
         && param.imap.port == 0
         && param.imap.security == Socket::Automatic
         && param.imap.user.is_empty()
@@ -429,15 +468,51 @@ async fn get_configured_param(
         && param.smtp.security == Socket::Automatic
         && param.smtp.user.is_empty()
     {
-        // No advanced parameters entered by the user:
-        // do Autoconfig unless the domain has hard-coded legacy servers.
-        match provider::legacy_settings_for_addr(&param.addr)?.autoconfig_servers {
-            Some(servers) => Some(servers),
-            None => get_autoconfig(ctx, param, &param_domain).await,
+        // no advanced parameters entered by the user: query provider-database or do Autoconfig
+        info!(
+            ctx,
+            "checking internal provider-info for offline autoconfig"
+        );
+
+        provider = provider::get_provider_info(&param_domain);
+        if let Some(provider) = provider {
+            if provider.server.is_empty() {
+                info!(ctx, "Offline autoconfig found, but no servers defined.");
+                param_autoconfig = None;
+            } else {
+                info!(ctx, "Offline autoconfig found.");
+                let servers = provider
+                    .server
+                    .iter()
+                    .map(|s| ServerParams {
+                        protocol: s.protocol,
+                        socket: s.socket,
+                        hostname: s.hostname.to_string(),
+                        port: s.port,
+                        username: match s.username_pattern {
+                            UsernamePattern::Email => param.addr.to_string(),
+                            UsernamePattern::Emaillocalpart => {
+                                if let Some(at) = param.addr.find('@') {
+                                    param.addr.split_at(at).0.to_string()
+                                } else {
+                                    param.addr.to_string()
+                                }
+                            }
+                        },
+                    })
+                    .collect();
+
+                param_autoconfig = Some(servers)
+            }
+        } else {
+            // Try receiving autoconfig
+            info!(ctx, "No offline autoconfig found.");
+            param_autoconfig = get_autoconfig(ctx, param, &param_domain).await;
         }
     } else {
-        None
-    };
+        provider = None;
+        param_autoconfig = None;
+    }
 
     progress!(ctx, 500);
 
@@ -516,6 +591,7 @@ async fn get_configured_param(
             .collect(),
         smtp_user: param.smtp.user.clone(),
         smtp_password,
+        provider,
         certificate_checks: match param.certificate_checks {
             EnteredCertificateChecks::Automatic => ConfiguredCertificateChecks::Automatic,
             EnteredCertificateChecks::Strict => ConfiguredCertificateChecks::Strict,
@@ -528,12 +604,12 @@ async fn get_configured_param(
     Ok(configured_login_param)
 }
 
-async fn configure(ctx: &Context, param: &EnteredLoginParam) -> Result<()> {
+async fn configure(ctx: &Context, param: &EnteredLoginParam) -> Result<Option<&'static Provider>> {
     progress!(ctx, 1);
 
     let configured_param = get_configured_param(ctx, param).await?;
     let proxy_config = ProxyConfig::load(ctx).await?;
-    let strict_tls = configured_param.strict_tls(proxy_config.is_some())?;
+    let strict_tls = configured_param.strict_tls(proxy_config.is_some());
 
     progress!(ctx, 550);
 
@@ -598,6 +674,7 @@ async fn configure(ctx: &Context, param: &EnteredLoginParam) -> Result<()> {
 
     progress!(ctx, 910);
 
+    let provider = configured_param.provider;
     configured_param
         .clone()
         .save_to_transports_table(ctx, param, time())
@@ -619,7 +696,7 @@ async fn configure(ctx: &Context, param: &EnteredLoginParam) -> Result<()> {
     ctx.sql.set_raw_config_bool("configured", true).await?;
     ctx.emit_event(EventType::AccountsItemChanged);
 
-    Ok(())
+    Ok(provider)
 }
 
 /// Retrieve available autoconfigurations.

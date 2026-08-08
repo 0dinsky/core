@@ -264,8 +264,8 @@ pub struct InnerContext {
     /// <https://datatracker.ietf.org/doc/html/rfc2971>
     pub(crate) server_id: RwLock<Option<HashMap<String, String>>>,
 
-    /// IMAP METADATA, per transport id.
-    pub(crate) metadata: RwLock<BTreeMap<u32, ServerMetadata>>,
+    /// IMAP METADATA.
+    pub(crate) metadata: RwLock<Option<ServerMetadata>>,
 
     /// ID for this `Context` in the current process.
     ///
@@ -293,7 +293,8 @@ pub struct InnerContext {
     /// because the lock is used from synchronous [`Context::emit_event`].
     pub(crate) debug_logging: std::sync::RwLock<Option<DebugLogging>>,
 
-    /// Push subscriber to store device token.
+    /// Push subscriber to store device token
+    /// and register for heartbeat notifications.
     pub(crate) push_subscriber: PushSubscriber,
 
     /// True if account has subscribed to push notifications via IMAP.
@@ -495,7 +496,7 @@ impl Context {
             quota: RwLock::new(BTreeMap::new()),
             new_msgs_notify,
             server_id: RwLock::new(None),
-            metadata: RwLock::new(BTreeMap::new()),
+            metadata: RwLock::new(None),
             creation_time: tools::Time::now(),
             last_error: parking_lot::RwLock::new("".to_string()),
             migration_error: parking_lot::RwLock::new(None),
@@ -575,26 +576,21 @@ impl Context {
         self.get_config_bool(Config::IsChatmail).await
     }
 
-    /// Returns maximum number of recipients a single email can be sent to.
-    pub(crate) async fn get_max_smtp_rcpt_to(&self) -> Result<u32> {
-        let Some((transport_id, param)) = ConfiguredLoginParam::load(self).await? else {
-            bail!("Not configured");
-        };
-        let metadata_limit = self
-            .metadata
-            .read()
-            .await
-            .get(&transport_id)
-            .and_then(|metadata| metadata.max_smtp_rcpt_to);
-        if let Some(limit) = metadata_limit {
-            return Ok(limit);
-        }
-        if let Some(limit) =
-            crate::provider::legacy_settings_for_addr(&param.addr)?.max_smtp_rcpt_to
-        {
-            return Ok(limit);
-        }
-        Ok(constants::DEFAULT_MAX_SMTP_RCPT_TO)
+    /// Returns maximum number of recipients the provider allows to send a single email to.
+    pub(crate) async fn get_max_smtp_rcpt_to(&self) -> Result<usize> {
+        let is_chatmail = self.is_chatmail().await?;
+        let val = self
+            .get_configured_provider()
+            .await?
+            .and_then(|provider| provider.opt.max_smtp_rcpt_to)
+            .map_or_else(
+                || match is_chatmail {
+                    true => constants::DEFAULT_CHATMAIL_MAX_SMTP_RCPT_TO,
+                    false => constants::DEFAULT_MAX_SMTP_RCPT_TO,
+                },
+                usize::from,
+            );
+        Ok(val)
     }
 
     /// Does a single round of fetching from IMAP and returns.
@@ -928,7 +924,7 @@ impl Context {
                 .unwrap_or_else(|| "<unset>".to_string()),
         );
 
-        if let Some(metadata) = self.metadata.read().await.values().next() {
+        if let Some(metadata) = &*self.metadata.read().await {
             if let Some(comment) = &metadata.comment {
                 res.insert("imap_server_comment", format!("{comment:?}"));
             }

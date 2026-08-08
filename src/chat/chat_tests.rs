@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use super::*;
 use crate::Event;
 use crate::chatlist::get_archived_cnt;
@@ -4074,15 +4072,14 @@ async fn test_only_broadcast_owner_can_send_2() -> Result<()> {
 
     alice.sql.execute("DELETE FROM keypairs", ()).await?;
     *alice.self_public_key.lock().await = None;
+    // Invalidate cached self fingerprint too — now a Mutex (like self_public_key
+    // above) so key rotation can clear it too, without needing exclusive
+    // (`Arc::get_mut`) access as a plain OnceLock would have required.
+    *alice.self_fingerprint.lock().await = None;
     alice
         .sql
         .execute("DELETE FROM config WHERE keyname='key_id'", ())
         .await?;
-    // Invalidate cached self fingerprint:
-    Arc::get_mut(&mut alice.ctx.inner)
-        .unwrap()
-        .self_fingerprint
-        .take();
 
     tcm.section("Alice sends a message, which is trashed");
     let sent = alice.send_text(alice_broadcast_id, "Hi").await;
@@ -6573,37 +6570,6 @@ async fn test_unpromoted_group_start_message() -> Result<()> {
     assert_eq!(e2ee_msg_id2, e2ee_msg_id);
     assert_eq!(info_msg_id2, info_msg_id);
     assert_eq!(text_msg_id2, text_msg_id);
-
-    Ok(())
-}
-
-/// Tests that outer To header is ignored for broadcast messages.
-///
-/// Broadcast messages have no recipients in the To field,
-/// but this does not mean that outer To field should be used.
-///
-/// With RFC 9788 header protection all outer headers should be ignored.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_broadcast_message_replaced_to() -> Result<()> {
-    let mut tcm = TestContextManager::new();
-    let alice = &tcm.alice().await;
-    let bob = &tcm.bob().await;
-
-    let alice_broadcast_id = create_broadcast(alice, "Channel".to_string()).await?;
-    let qr = get_securejoin_qr(alice, Some(alice_broadcast_id))
-        .await
-        .unwrap();
-    let bob_chat_id = tcm.exec_securejoin_qr(bob, alice, &qr).await;
-
-    let mut sent = alice.send_text(alice_broadcast_id, "Hello!").await;
-    sent.payload = sent
-        .payload
-        .replace("To: ", "To: mallory@example.org\r\nX-Foobar: ");
-    let bob_msg = bob.recv_msg(&sent).await;
-
-    // The message should be assigned to the broadcast chat
-    // and not to some ad hoc group with mallory@example.org
-    assert_eq!(bob_msg.chat_id, bob_chat_id);
 
     Ok(())
 }

@@ -1,10 +1,10 @@
 //! Variable server parameters lists
 
-pub use crate::provider::{Protocol, Socket};
+use crate::provider::{Protocol, Socket};
 
 /// Set of variable parameters to try during configuration.
 ///
-/// Can be loaded from online configuration
+/// Can be loaded from offline provider database, online configuration
 /// or derived from user entered parameters.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ServerParams {
@@ -302,7 +302,8 @@ mod tests {
         // as this is very uncommon configuration
         // and not worth doubling the number of candidates to try.
         // If such configuration is used, email provider
-        // should provide XML autoconfig.
+        // should provide XML autoconfig or
+        // be added to the provider database as an exception.
         let v = expand_param_vector(
             vec![ServerParams {
                 protocol: Protocol::Imap,

@@ -237,7 +237,7 @@ const CONTACT_COMMANDS: [&str; 9] = [
     "import-vcard",
     "make-vcard",
 ];
-const MISC_COMMANDS: [&str; 13] = [
+const MISC_COMMANDS: [&str; 14] = [
     "getqr",
     "getqrsvg",
     "getbadqr",
@@ -245,6 +245,7 @@ const MISC_COMMANDS: [&str; 13] = [
     "joinqr",
     "setqr",
     "createqrsvg",
+    "providerinfo",
     "fileinfo",
     "estimatedeletion",
     "clear",

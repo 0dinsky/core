@@ -242,8 +242,7 @@ impl Context {
             .metadata
             .read()
             .await
-            .values()
-            .next()
+            .as_ref()
             .and_then(|conf| conf.iroh_relay.clone())
         {
             RelayMode::Custom(RelayUrl::from(relay_url).into())

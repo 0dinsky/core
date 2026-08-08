@@ -13,6 +13,7 @@ use anyhow::{Context as _, Result};
 use base64::Engine as _;
 use pgp::crypto::aead::{AeadAlgorithm, ChunkSize};
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
+use tokio::sync::RwLock;
 
 use crate::context::Context;
 use crate::key::DcKey;
@@ -26,9 +27,13 @@ use crate::key::DcKey;
 ///
 /// Each account (context) can then retrieve device token
 /// from this structure and give it to the email server.
+/// If email server does not support push notifications,
+/// account can call `subscribe` method
+/// to register device token with the heartbeat
+/// notification provider server as a fallback.
 #[derive(Debug, Clone, Default)]
 pub struct PushSubscriber {
-    device_token: Arc<parking_lot::RwLock<Option<String>>>,
+    inner: Arc<RwLock<PushSubscriberState>>,
 }
 
 /// The key was generated with
@@ -98,8 +103,8 @@ impl PushSubscriber {
 
     /// Sets device token for Apple Push Notification service
     /// or Firebase Cloud Messaging.
-    pub(crate) fn set_device_token(&self, token: &str) {
-        *self.device_token.write() = Some(token.to_string());
+    pub(crate) async fn set_device_token(&self, token: &str) {
+        self.inner.write().await.device_token = Some(token.to_string());
     }
 
     /// Retrieves device token.
@@ -112,9 +117,59 @@ impl PushSubscriber {
     ///
     /// IMAP loop should periodically check if device token is available
     /// and send the token to the email server if it supports push notifications.
-    pub(crate) fn device_token(&self) -> Option<String> {
-        self.device_token.read().clone()
+    pub(crate) async fn device_token(&self) -> Option<String> {
+        self.inner.read().await.device_token.clone()
     }
+
+    /// Subscribes for heartbeat notifications with previously set device token.
+    #[cfg(target_os = "ios")]
+    pub(crate) async fn subscribe(&self, context: &Context) -> Result<()> {
+        use crate::net::http;
+
+        let mut state = self.inner.write().await;
+
+        if state.heartbeat_subscribed {
+            return Ok(());
+        }
+
+        let Some(ref token) = state.device_token else {
+            return Ok(());
+        };
+
+        info!(context, "Subscribing for heartbeat notifications.");
+        if http::post_string(
+            context,
+            "https://notifications.delta.chat/register",
+            format!("{{\"token\":\"{token}\"}}"),
+        )
+        .await?
+        {
+            info!(context, "Subscribed for heartbeat notifications.");
+            state.heartbeat_subscribed = true;
+        }
+        Ok(())
+    }
+
+    /// Placeholder to skip subscribing to heartbeat notifications outside iOS.
+    #[cfg(not(target_os = "ios"))]
+    pub(crate) async fn subscribe(&self, _context: &Context) -> Result<()> {
+        let mut state = self.inner.write().await;
+        state.heartbeat_subscribed = true;
+        Ok(())
+    }
+
+    pub(crate) async fn heartbeat_subscribed(&self) -> bool {
+        self.inner.read().await.heartbeat_subscribed
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PushSubscriberState {
+    /// Device token.
+    device_token: Option<String>,
+
+    /// If subscribed to heartbeat push notifications.
+    heartbeat_subscribed: bool,
 }
 
 /// Push notification state
@@ -125,15 +180,20 @@ pub enum NotifyState {
     #[default]
     NotConnected = 0,
 
+    /// Subscribed to heartbeat push notifications.
+    Heartbeat = 1,
+
     /// Subscribed to push notifications for new messages.
     Connected = 2,
 }
 
 impl Context {
     /// Returns push notification subscriber state.
-    pub fn push_state(&self) -> NotifyState {
+    pub async fn push_state(&self) -> NotifyState {
         if self.push_subscribed.load(Ordering::Relaxed) {
             NotifyState::Connected
+        } else if self.push_subscriber.heartbeat_subscribed().await {
+            NotifyState::Heartbeat
         } else {
             NotifyState::NotConnected
         }
@@ -144,13 +204,13 @@ impl Context {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_set_device_token() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_set_device_token() {
         let push_subscriber = PushSubscriber::new();
-        assert_eq!(push_subscriber.device_token(), None);
+        assert_eq!(push_subscriber.device_token().await, None);
 
-        push_subscriber.set_device_token("some-token");
-        let device_token = push_subscriber.device_token().unwrap();
+        push_subscriber.set_device_token("some-token").await;
+        let device_token = push_subscriber.device_token().await.unwrap();
         assert_eq!(device_token, "some-token");
     }
 

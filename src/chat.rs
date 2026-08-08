@@ -2989,6 +2989,7 @@ WHERE id=?
         )
         .await?;
 
+    let chunk_size = context.get_max_smtp_rcpt_to().await?;
     let trans_fn = |t: &mut rusqlite::Transaction| {
         let mut row_ids = Vec::<i64>::new();
 
@@ -2998,16 +2999,16 @@ WHERE id=?
                 (),
             )?;
         }
-        if !recipients.is_empty() {
-            let mut stmt = t.prepare(
-                "INSERT INTO smtp (rfc724_mid, recipients, mime, msg_id)
-                VALUES            (?1,         ?2,         ?3,   ?4)",
-            )?;
-            let all_recipients = recipients.join(" ");
+        let mut stmt = t.prepare(
+            "INSERT INTO smtp (rfc724_mid, recipients, mime, msg_id)
+            VALUES            (?1,         ?2,         ?3,   ?4)",
+        )?;
+        for recipients_chunk in recipients.chunks(chunk_size) {
+            let recipients_chunk = recipients_chunk.join(" ");
             if let Some(pre_msg) = &rendered_pre_msg {
                 let row_id = stmt.execute((
                     &pre_msg.rfc724_mid,
-                    &all_recipients,
+                    &recipients_chunk,
                     &pre_msg.message,
                     msg.id,
                 ))?;
@@ -3015,7 +3016,7 @@ WHERE id=?
             }
             let row_id = stmt.execute((
                 &rendered_msg.rfc724_mid,
-                &all_recipients,
+                &recipients_chunk,
                 &rendered_msg.message,
                 msg.id,
             ))?;
@@ -3229,8 +3230,8 @@ pub async fn marknoticed_all_chats(context: &Context) -> Result<()> {
                    AND c.blocked=0;",
             (MessageState::InFresh,),
             |row| {
-                let chat_id: ChatId = row.get(0)?;
-                Ok(chat_id)
+                let msg_id: ChatId = row.get(0)?;
+                Ok(msg_id)
             },
         )
         .await?;

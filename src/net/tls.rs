@@ -135,13 +135,37 @@ pub async fn wrap_rustls<'a>(
         vec![alpn.as_bytes().to_vec()]
     };
 
-    // Enable TLS 1.3 session resumption
-    // as defined in <https://www.rfc-editor.org/rfc/rfc8446#section-2.2>.
+    // ── Perfect Forward Secrecy (PFS) ────────────────────────────────────────
     //
-    // Obsolete TLS 1.2 mechanisms defined in RFC 5246
-    // and RFC 5077 have worse security
-    // and are not worth increasing
-    // attack surface: <https://words.filippo.io/we-need-to-talk-about-session-tickets/>.
+    // TLS 1.3 (the default when using rustls) provides PFS unconditionally:
+    // every handshake uses a fresh ephemeral key exchange (X25519 or similar)
+    // so that compromise of the server's long-term certificate key cannot
+    // retroactively decrypt past sessions.
+    //
+    // TLS 1.2 session resumption (RFC 5246 / RFC 5077) can weaken PFS by
+    // reusing earlier session secrets.  We explicitly disable it below.
+    // TLS 1.3 ticket resumption (RFC 8446 §2.2) is safe because it does not
+    // reuse the ephemeral key; we keep it enabled to reduce handshake latency
+    // on repeated connections to the same IMAP/SMTP server.
+    //
+    // ── Post-Quantum TLS ──────────────────────────────────────────────────────
+    //
+    // rustls ≥ 0.23 with the `aws-lc-rs` backend supports the
+    // X25519MLKEM768 hybrid group (draft-ietf-tls-hybrid-design).
+    // The current build uses the `ring` backend (default-features = false),
+    // which does not yet support PQ groups.
+    //
+    // To enable post-quantum TLS key exchange:
+    //   1. Switch `tokio-rustls` to `features = ["aws-lc-rs"]` in Cargo.toml.
+    //   2. Remove the `ring` feature if present.
+    //   3. Uncomment the line below to add X25519MLKEM768 as the preferred group.
+    //
+    // config.resumption.tls_kx_groups = vec![
+    //     rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+    //     rustls::crypto::aws_lc_rs::kx_group::X25519,
+    // ];
+    //
+    // Classic peers negotiate X25519 as a fallback, so this is backward-compatible.
     let resumption_store = tls_session_store.get(port, alpn);
     let resumption = rustls::client::Resumption::store(resumption_store)
         .tls12_resumption(rustls::client::Tls12Resumption::Disabled);

@@ -398,7 +398,7 @@ pub unsafe extern "C" fn dc_get_push_state(context: *const dc_context_t) -> libc
         return 0;
     }
     let ctx = &*context;
-    ctx.push_state() as libc::c_int
+    block_on(ctx.push_state()) as libc::c_int
 }
 
 fn spawn_configure(ctx: Context) {
@@ -4533,6 +4533,99 @@ fn convert_and_prune_message_ids(msg_ids: *const u32, msg_cnt: libc::c_int) -> V
     msg_ids
 }
 
+// dc_provider_t
+
+pub type dc_provider_t = provider::Provider;
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_provider_new_from_email(
+    context: *const dc_context_t,
+    addr: *const libc::c_char,
+) -> *const dc_provider_t {
+    if context.is_null() || addr.is_null() {
+        eprintln!("ignoring careless call to dc_provider_new_from_email()");
+        return ptr::null();
+    }
+    let addr = to_string_lossy(addr);
+
+    let ctx = &*context;
+
+    match provider::get_provider_info_by_addr(addr.as_str())
+        .log_err(ctx)
+        .unwrap_or_default()
+    {
+        Some(provider) => provider,
+        None => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_provider_new_from_email_with_dns(
+    context: *const dc_context_t,
+    addr: *const libc::c_char,
+) -> *const dc_provider_t {
+    if context.is_null() || addr.is_null() {
+        eprintln!("ignoring careless call to dc_provider_new_from_email_with_dns()");
+        return ptr::null();
+    }
+    let addr = to_string_lossy(addr);
+
+    let ctx = &*context;
+
+    match provider::get_provider_info_by_addr(addr.as_str())
+        .log_err(ctx)
+        .unwrap_or_default()
+    {
+        Some(provider) => provider,
+        None => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_provider_get_overview_page(
+    provider: *const dc_provider_t,
+) -> *mut libc::c_char {
+    if provider.is_null() {
+        eprintln!("ignoring careless call to dc_provider_get_overview_page()");
+        return "".strdup();
+    }
+    let provider = &*provider;
+    provider.overview_page.strdup()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_provider_get_before_login_hint(
+    provider: *const dc_provider_t,
+) -> *mut libc::c_char {
+    if provider.is_null() {
+        eprintln!("ignoring careless call to dc_provider_get_before_login_hint()");
+        return "".strdup();
+    }
+    let provider = &*provider;
+    provider.before_login_hint.strdup()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_provider_get_status(provider: *const dc_provider_t) -> libc::c_int {
+    if provider.is_null() {
+        eprintln!("ignoring careless call to dc_provider_get_status()");
+        return 0;
+    }
+    let provider = &*provider;
+    provider.status as libc::c_int
+}
+
+#[no_mangle]
+#[allow(clippy::needless_return)]
+pub unsafe extern "C" fn dc_provider_unref(provider: *mut dc_provider_t) {
+    if provider.is_null() {
+        eprintln!("ignoring careless call to dc_provider_unref()");
+        return;
+    }
+    // currently, there is nothing to free, the provider info is a static object.
+    // this may change once we start localizing string.
+}
+
 // -- Accounts
 
 /// Reader-writer lock wrapper for accounts manager to guarantee thread safety when using
@@ -4927,7 +5020,7 @@ pub unsafe extern "C" fn dc_accounts_set_push_device_token(
 
     block_on(async move {
         let accounts = accounts.read().await;
-        if let Err(err) = accounts.set_push_device_token(&token) {
+        if let Err(err) = accounts.set_push_device_token(&token).await {
             accounts.emit_event(EventType::Error(format!(
                 "Failed to set notify token: {err:#}."
             )));
