@@ -311,6 +311,19 @@ pub(crate) async fn load_self_public_key_opt(context: &Context) -> Result<Option
     Ok(Some(signed_public_key))
 }
 
+/// Returns which algorithm family (classic or post-quantum) our own current
+/// encryption subkey uses, for display in settings/account UI (e.g. "Your
+/// key: Post-quantum").
+///
+/// Returns `None` if we don't have a key yet (it hasn't been generated,
+/// e.g. because no message was sent or received yet).
+pub async fn self_encryption_kind(context: &Context) -> Result<Option<crate::pgp::EncryptionKind>> {
+    let Some(public_key) = load_self_public_key_opt(context).await? else {
+        return Ok(None);
+    };
+    Ok(crate::pgp::encryption_kind(&public_key))
+}
+
 /// Loads own public key.
 ///
 /// If no key is generated yet, generates a new one.
@@ -705,6 +718,41 @@ pub(crate) async fn maybe_rotate_keypair(context: &Context) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Immediately generates a fresh keypair — honoring the current
+/// `Config::KeyGenMode` — and makes it the active self key, without waiting
+/// for `Config::KeyRotationPeriod` to elapse.
+///
+/// This is meant to be called right after the user changes `KeyGenMode`
+/// (e.g. turns on post-quantum key generation) if they want the change to
+/// take effect for their existing account immediately, rather than only for
+/// the next account they set up or the next scheduled rotation.
+///
+/// As with any key rotation, this changes the account's fingerprint:
+/// contacts who have "Verified" this account will see it as unverified
+/// again until they re-verify (e.g. by scanning a fresh QR code). The old
+/// key's secret material is kept for a few more days (see
+/// `KEY_ROTATION_GRACE_DAYS`) so that messages already in flight can still
+/// be decrypted, then permanently erased by [`maybe_rotate_keypair`].
+pub async fn rotate_keypair_now(context: &Context) -> Result<()> {
+    let key_gen_mode = context.get_config_int(Config::KeyGenMode).await?;
+    let addr = context.get_primary_self_addr().await?;
+    let addr = EmailAddress::new(&addr)?;
+    info!(
+        context,
+        "Rotating self key on demand (key_gen_mode={key_gen_mode})."
+    );
+    let new_key = Handle::current()
+        .spawn_blocking(move || {
+            if key_gen_mode == 1 {
+                crate::pgp::create_pqc_keypair(addr)
+            } else {
+                crate::pgp::create_keypair(addr)
+            }
+        })
+        .await??;
+    rotate_self_keypair(context, &new_key).await
 }
 
 /// Makes `new_key` the active self key, keeping the previously active key

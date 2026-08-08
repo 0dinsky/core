@@ -28,7 +28,7 @@ use deltachat::contact::{Contact, ContactId, Origin};
 use deltachat::context::{Context, ContextBuilder};
 use deltachat::ephemeral::Timer as EphemeralTimer;
 use deltachat::imex::BackupProvider;
-use deltachat::key::preconfigure_keypair;
+use deltachat::key::{preconfigure_keypair, rotate_keypair_now, self_encryption_kind};
 use deltachat::message::MsgId;
 use deltachat::qr_code_generator::{create_qr_svg, generate_backup_qr, get_securejoin_qr_svg};
 use deltachat::stock_str::StockMessage;
@@ -898,6 +898,53 @@ pub unsafe extern "C" fn dc_preconfigure_keypair(
         .context("Failed to save keypair")
         .log_err(ctx)
         .is_ok() as libc::c_int
+}
+
+/// Immediately generates a fresh keypair for the account (honoring the
+/// current `key_gen_mode` config value, e.g. post-quantum if enabled) and
+/// makes it the active key, without waiting for `key_rotation_period` to
+/// elapse. Intended to be called right after the user flips `key_gen_mode`,
+/// if they want the change to apply to an existing account immediately.
+///
+/// Like any key rotation, this changes the account's fingerprint: contacts
+/// who verified this account will need to re-verify. Returns `1` on
+/// success, `0` on failure.
+#[no_mangle]
+pub unsafe extern "C" fn dc_rotate_keypair_now(context: *mut dc_context_t) -> libc::c_int {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_rotate_keypair_now()");
+        return 0;
+    }
+    let ctx = &*context;
+    block_on(rotate_keypair_now(ctx))
+        .context("Failed to rotate keypair")
+        .log_err(ctx)
+        .is_ok() as libc::c_int
+}
+
+/// Returns which algorithm family our own current encryption key uses, as a
+/// short stable identifier: `"classic"`, `"pq"` (post-quantum hybrid), or
+/// `""` if we don't have a key yet or it could not be determined.
+///
+/// Meant for display in settings/account UI, e.g. next to a "regenerate
+/// keys" action. Must be released with `dc_str_unref()`.
+#[no_mangle]
+pub unsafe extern "C" fn dc_get_self_encryption_kind(
+    context: *mut dc_context_t,
+) -> *mut libc::c_char {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_get_self_encryption_kind()");
+        return "".strdup();
+    }
+    let ctx = &*context;
+    block_on(self_encryption_kind(ctx))
+        .context("Failed to determine self encryption kind")
+        .log_err(ctx)
+        .ok()
+        .flatten()
+        .map(|kind| kind.as_param_str())
+        .unwrap_or_default()
+        .strdup()
 }
 
 #[no_mangle]

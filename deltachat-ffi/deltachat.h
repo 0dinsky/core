@@ -812,6 +812,44 @@ void            dc_maybe_network             (dc_context_t* context);
 int             dc_preconfigure_keypair        (dc_context_t* context, const char *secret_data);
 
 
+/**
+ * Immediately generate a fresh keypair for the account, honoring the
+ * current `key_gen_mode` config value (`0`=classic, `1`=post-quantum
+ * hybrid, see dc_set_config()), and make it the active key — without
+ * waiting for `key_rotation_period` to elapse.
+ *
+ * Call this right after changing `key_gen_mode` if the change should take
+ * effect for an existing account immediately, rather than only for the
+ * next account or the next scheduled rotation.
+ *
+ * As with any key rotation, this changes the account's fingerprint:
+ * contacts who verified this account will see it as unverified again until
+ * they re-verify (e.g. by scanning a fresh QR code).
+ *
+ * @memberof dc_context_t
+ * @param context The context as created by dc_context_new().
+ * @return 1 on success, 0 on failure.
+ */
+int             dc_rotate_keypair_now          (dc_context_t* context);
+
+
+/**
+ * Get the algorithm family of the account's own current encryption key, for
+ * display in settings/account UI.
+ *
+ * @memberof dc_context_t
+ * @param context The context as created by dc_context_new().
+ * @return A string that is one of:
+ *     - "classic" - classic ECC encryption (ECDH/X25519)
+ *     - "pq" - post-quantum hybrid encryption (ML-KEM-768+X25519 or similar,
+ *       per draft-ietf-openpgp-pqc)
+ *     - "" (empty string) - no key yet, or the algorithm could not be
+ *       determined
+ *   Must be released using dc_str_unref() when no longer used.
+ */
+char*           dc_get_self_encryption_kind    (dc_context_t* context);
+
+
 // handle chatlists
 
 #define         DC_GCL_ARCHIVED_ONLY         0x01
