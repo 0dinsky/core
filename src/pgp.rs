@@ -83,30 +83,19 @@ pub(crate) fn create_keypair(addr: EmailAddress) -> Result<SignedSecretKey> {
 
 /// Creates a post-quantum hybrid keypair (OpenPGP v6).
 ///
-/// Uses hybrid algorithms from draft-ietf-openpgp-pqc (nearly-final RFC):
-/// - **Signing** (primary key): **ML-DSA-65 + Ed25519** composite
-///   (`KeyType::MlDsa65Ed25519`, OpenPGP algorithm 30). Both components
-///   must verify for the signature to be accepted — classical strength is
-///   never weaker than today, and the ML-DSA part is quantum-resistant.
-/// - **Encryption** (subkey): X25519 + ML-KEM-768 hybrid KEM.
+/// Uses hybrid algorithms from draft-ietf-openpgp-pqc:
+/// - **Signing** (primary key): Ed25519 v6 (non-legacy 32-byte format, algorithm 27)
+/// - **Encryption** (subkey): X25519 + ML-KEM-768 hybrid KEM (algorithm 0x1d)
 ///
 /// # Backward compatibility
 ///
-/// - **Encryption**: peers that do not support PQC fall back to the X25519
-///   component of the hybrid KEM and can still send encrypted messages.
-///   Decryption by the PQC key holder works in all cases.
-/// - **Signatures**: classic clients that do not understand ML-DSA-65+Ed25519
-///   will not be able to *verify* our signatures. They can still decrypt
-///   (via X25519) and will treat the message as unsigned / unverified.
-///   PQC-capable peers verify both components.
+/// Peers that do **not** support PQC (classic OpenPGP clients) fall back to the
+/// X25519 component of the hybrid KEM and can still send encrypted messages.
+/// Decryption by the PQC key holder works in all cases.
 ///
-/// # Why ML-DSA-65 + Ed25519
-///
-/// - Matches the MUST algorithm in draft-ietf-openpgp-pqc (alg ID 30).
-/// - ~128–192-bit post-quantum security while keeping a classical Ed25519
-///   fallback inside the same composite key.
-/// - Signature size is larger (~3.3 KB) than pure Ed25519 (64 B); this is
-///   the expected cost of quantum-resistant authenticity.
+/// PQC signatures protect against harvest-now/decrypt-later attacks on
+/// message authenticity; the hybrid KEM protects confidentiality against
+/// future quantum adversaries.
 ///
 /// # Requirement
 ///
@@ -114,11 +103,10 @@ pub(crate) fn create_keypair(addr: EmailAddress) -> Result<SignedSecretKey> {
 /// (already set in `Cargo.toml`).
 pub(crate) fn create_pqc_keypair(addr: EmailAddress) -> Result<SignedSecretKey> {
     // Composite ML-DSA-65 + Ed25519 for signing (OpenPGP algorithm 30).
-    // Both the lattice and the elliptic-curve signatures must verify.
+    // Adaptive signing uses this only when all recipients support PQ signatures.
     let signing_key_type = PgpKeyType::MlDsa65Ed25519;
 
     // Hybrid ML-KEM-768 + X25519 for encryption.
-    // Classic receivers use the X25519 component; PQC-capable receivers use both.
     let encryption_key_type = PgpKeyType::MlKem768X25519;
 
     let key_params = SecretKeyParamsBuilder::default()
@@ -241,6 +229,102 @@ pub fn encryption_kind_secret(key: &SignedSecretKey) -> Option<EncryptionKind> {
         .iter()
         .find(|subkey| subkey.algorithm().can_encrypt())
         .map(|subkey| classify_encryption_algorithm(subkey.algorithm()))
+}
+
+/// True if the public key primary can verify PQ composite signatures.
+pub fn supports_pq_signatures(key: &SignedPublicKey) -> bool {
+    use pgp::crypto::public_key::PublicKeyAlgorithm;
+    matches!(
+        key.primary_key.algorithm(),
+        PublicKeyAlgorithm::MlDsa65Ed25519
+            | PublicKeyAlgorithm::MlDsa87Ed448
+            | PublicKeyAlgorithm::SlhDsaShake128s
+            | PublicKeyAlgorithm::SlhDsaShake128f
+            | PublicKeyAlgorithm::SlhDsaShake256s
+    )
+}
+
+/// True if the secret key primary is a PQ signing key.
+pub fn is_pq_signing_secret(key: &SignedSecretKey) -> bool {
+    use pgp::crypto::public_key::PublicKeyAlgorithm;
+    matches!(
+        key.primary_key.algorithm(),
+        PublicKeyAlgorithm::MlDsa65Ed25519
+            | PublicKeyAlgorithm::MlDsa87Ed448
+            | PublicKeyAlgorithm::SlhDsaShake128s
+            | PublicKeyAlgorithm::SlhDsaShake128f
+            | PublicKeyAlgorithm::SlhDsaShake256s
+    )
+}
+
+/// Rotates **only the encryption subkey**, keeping the primary key (and thus
+/// the OpenPGP fingerprint) unchanged.
+///
+/// This preserves "Verified" status for contacts who already verified us:
+/// their stored fingerprint still matches our primary key.
+///
+/// Old encryption subkey material remains on the returned key as an additional
+/// subkey so in-flight messages encrypted to the old subkey can still be
+/// decrypted until the key is eventually replaced entirely.
+pub fn rotate_encryption_subkey(
+    existing: &SignedSecretKey,
+    addr: EmailAddress,
+    use_pq_encryption: bool,
+) -> Result<SignedSecretKey> {
+    use pgp::composed::SignedSecretSubKey;
+    use pgp::packet::KeyFlags;
+    use pgp::types::SecretKeyTrait;
+
+    // Generate a temporary keypair solely to obtain a fresh encryption subkey
+    // of the desired algorithm family.
+    let temp = if use_pq_encryption {
+        create_pqc_keypair(addr)?
+    } else {
+        create_keypair(addr)?
+    };
+    let new_sub_key = temp
+        .secret_subkeys
+        .into_iter()
+        .next()
+        .context("temporary keypair has no encryption subkey")?;
+
+    let mut rng = thread_rng();
+    let mut keyflags = KeyFlags::default();
+    // Mark as encryption-capable (storage + communications).
+    keyflags.set_encrypt_comms(true);
+    keyflags.set_encrypt_storage(true);
+
+    let binding_sig = new_sub_key.key.sign(
+        &mut rng,
+        &existing.primary_key,
+        existing.primary_key.public_key(),
+        &Password::empty(),
+        keyflags,
+        None,
+    )?;
+
+    let new_signed_sub = SignedSecretSubKey::new(new_sub_key.key, vec![binding_sig]);
+    let new_pub_sub = SignedPublicSubKey {
+        key: new_signed_sub.public_key().clone(),
+        signatures: new_signed_sub.signatures.clone(),
+    };
+
+    // New encryption subkey first (preferred); keep old subkeys for decryption.
+    let mut secret_subkeys = vec![new_signed_sub];
+    secret_subkeys.extend(existing.secret_subkeys.clone());
+    let mut public_subkeys = vec![new_pub_sub];
+    public_subkeys.extend(existing.public_subkeys.clone());
+
+    let rotated = SignedSecretKey {
+        primary_key: existing.primary_key.clone(),
+        details: existing.details.clone(),
+        public_subkeys,
+        secret_subkeys,
+    };
+    rotated
+        .verify_bindings()
+        .context("rotated key failed binding verification")?;
+    Ok(rotated)
 }
 
 /// Version of SEIPD packet to use.

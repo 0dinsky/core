@@ -7,8 +7,10 @@ use mail_builder::mime::MimePart;
 
 use crate::aheader::{Aheader, EncryptPreference};
 use crate::context::Context;
-use crate::key::{SignedPublicKey, load_self_public_key, load_self_secret_key};
-use crate::pgp::{self, SeipdVersion};
+use crate::key::{
+    SignedPublicKey, load_self_public_key, load_self_secret_key, load_signing_secret_key,
+};
+use crate::pgp::{self, SeipdVersion, supports_pq_signatures};
 
 #[derive(Debug)]
 pub struct EncryptHelper {
@@ -60,7 +62,9 @@ impl EncryptHelper {
         compress: bool,
         seipd_version: SeipdVersion,
     ) -> Result<String> {
-        let sign_key = load_self_secret_key(context).await?;
+        // Adaptive signatures: PQ only if every recipient can verify it.
+        let prefer_pq = !keyring.is_empty() && keyring.iter().all(supports_pq_signatures);
+        let sign_key = load_signing_secret_key(context, prefer_pq).await?;
         let ctext =
             pgp::pk_encrypt(raw_message, keyring, sign_key, compress, seipd_version).await?;
 
@@ -77,8 +81,9 @@ impl EncryptHelper {
         compress: bool,
         sign: bool,
     ) -> Result<String> {
+        // Broadcast: prefer classic so most subscribers can verify.
         let sign_key = if sign {
-            Some(load_self_secret_key(context).await?)
+            Some(load_signing_secret_key(context, false).await?)
         } else {
             None
         };
