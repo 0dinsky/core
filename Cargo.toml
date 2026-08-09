@@ -78,6 +78,10 @@ num-derive = "0.4"
 num-traits = { workspace = true }
 parking_lot = "0.12.4"
 percent-encoding = "2.3"
+# draft-pqc implements draft-ietf-openpgp-pqc-12. RFC 9980 is final; rPGP main
+# already renamed the feature to `pqc` and changed algorithm IDs. When a
+# crates.io release with `features = ["pqc"]` appears, bump this dependency
+# and force a one-time key migration (old draft keys will not interoperate).
 pgp = { version = "0.20.0", features = ["draft-pqc"], default-features = false }
 pin-project = "1"
 qrcodegen = "1.7.0"

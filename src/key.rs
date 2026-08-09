@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 use std::io::Cursor;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail, ensure};
 use base64::Engine as _;
@@ -677,35 +678,45 @@ pub async fn preconfigure_keypair(context: &Context, secret_data: &str) -> Resul
 }
 
 /// How long, in days, to keep the secret material of a rotated-out key
-/// around after it stops being the active key, before erasing it for good.
+/// (or of an old encryption subkey still embedded in the current key)
+/// around before erasing it for good.
 ///
 /// This grace period exists so that messages already in flight (e.g. stuck
 /// on a slow relay, or sent by a contact who hasn't fetched our latest
 /// Autocrypt header yet) can still be decrypted. Once the grace period is
-/// over, the old secret key is permanently deleted: this is the step that
-/// actually buys forward secrecy, since after that point, not even we can
-/// decrypt what was encrypted to that key anymore.
+/// over, the old secret material is permanently deleted: this is the step
+/// that actually approximates forward secrecy. OpenPGP has no native PFS;
+/// the combination of subkey rotation + explicit forget is the best
+/// "pretty good forward secrecy" available (see Autocrypt v2 discussions
+/// and the 2026 OpenPGP Email Summit minutes).
+///
+/// Increasing this value improves decryptability of delayed mail at the
+/// cost of a longer window in which a compromised device can still read
+/// recent past traffic.
 const KEY_ROTATION_GRACE_DAYS: i64 = 3;
 
 /// If `Config::KeyRotationPeriod` is set and our current key is older than
-/// that many days, generates a fresh keypair (same generation mode as the
-/// current key — classic or post-quantum) and makes it the active key.
-/// Also permanently erases any previously-rotated-out key whose grace
-/// period has elapsed, regardless of whether rotation is currently enabled
-/// (so turning rotation off does not leave old keys lying around forever).
+/// that many days, rotates the encryption subkey (or, when switching
+/// classic ↔ post-quantum primary, generates a whole new keypair) and
+/// makes the result the active key.
 ///
-/// ## Caveat: this rotates the whole keypair, not just the encryption subkey
+/// Also permanently erases any previously-rotated-out keypair rows whose
+/// grace period has elapsed, **and** forgets encryption subkeys that are
+/// still embedded inside the *current* key once they are past the same
+/// grace period. The two are not the same thing: `rotate_encryption_subkey`
+/// folds every previous encryption subkey into each new key it produces
+/// (so in-flight messages keep decrypting across a rotation), which means
+/// those old subkeys survive inside the current key indefinitely unless
+/// pruned here explicitly via [`crate::pgp::forget_expired_encryption_subkeys`].
+/// Without that second step, deleting old `keypairs` rows would only
+/// remove redundant snapshots — the current key would still happily
+/// decrypt with arbitrarily old subkey material, silently defeating the
+/// forward-secrecy approximation this function provides.
 ///
-/// Ideally only the encryption subkey would be rotated, keeping the signing
-/// primary key (and therefore the fingerprint) stable, so that contacts who
-/// have "Verified" this fingerprint wouldn't need to re-verify after every
-/// rotation. The OpenPGP library used here (rPGP 0.20) has no supported API
-/// to bind a freshly generated subkey to an *existing* primary key, only to
-/// generate a whole new keypair from scratch — so that's what this does.
-/// Practically: a rotation changes the fingerprint, and contacts will see
-/// "unverified" until they re-verify, the same as if the user had manually
-/// reset their key. Peers still get the new key automatically via the
-/// Autocrypt header on the next message either way.
+/// When only the encryption subkey is rotated the primary fingerprint
+/// (and therefore Verified status at contacts) stays stable. A full
+/// classic↔PQ primary switch does change the fingerprint and requires
+/// re-verification.
 pub(crate) async fn maybe_rotate_keypair(context: &Context) -> Result<()> {
     let now = tools::time();
 
@@ -784,6 +795,30 @@ pub(crate) async fn maybe_rotate_keypair(context: &Context) -> Result<()> {
             context,
             "Erased {deleted} rotated-out keypair(s) past their grace period."
         );
+    }
+
+    // Forget encryption subkeys embedded *inside the current key* that are
+    // past the same grace period. See the doc comment above: this is a
+    // separate step from the row deletion above and is what actually makes
+    // old subkey material unrecoverable.
+    let cutoff = UNIX_EPOCH + Duration::from_secs(cutoff.max(0) as u64);
+    let current = load_self_secret_key(context).await?;
+    let subkeys_before = current.secret_subkeys.len();
+    let pruned = Handle::current()
+        .spawn_blocking(move || crate::pgp::forget_expired_encryption_subkeys(&current, cutoff))
+        .await?;
+    // An `Err` here just means there was nothing safe to prune yet (e.g. a
+    // single remaining subkey not old enough, or no rotation has happened
+    // yet) — not a real error.
+    if let Ok(pruned_key) = pruned {
+        let forgotten = subkeys_before.saturating_sub(pruned_key.secret_subkeys.len());
+        if forgotten > 0 {
+            save_current_keypair(context, &pruned_key).await?;
+            info!(
+                context,
+                "Forgot {forgotten} expired encryption subkey(s) past their grace period."
+            );
+        }
     }
 
     Ok(())
@@ -877,6 +912,35 @@ async fn rotate_self_keypair(context: &Context, new_key: &SignedSecretKey) -> Re
     *context.self_fingerprint.lock().await = None;
     context.emit_event(EventType::AccountsItemChanged);
     config_cache_lock.insert("key_id".to_string(), Some(new_key_id.to_string()));
+    Ok(())
+}
+
+/// Overwrites the currently active key's stored bytes in place with `key`,
+/// without touching its `created` timestamp or its `keypairs` row id, and
+/// without changing which row `key_id` points to.
+///
+/// Unlike [`rotate_self_keypair`], this does not introduce a new key
+/// generation — it's for saving an in-place edit of the current key (e.g.
+/// after [`forget_expired_encryption_subkeys`](crate::pgp::forget_expired_encryption_subkeys)
+/// pruned some of its embedded subkeys), where inserting a fresh row and
+/// old-row grace period would be pointless churn.
+async fn save_current_keypair(context: &Context, key: &SignedSecretKey) -> Result<()> {
+    let public_key = key.to_public_key();
+    let public_key_bytes = DcKey::to_bytes(&public_key);
+    let secret_key_bytes = DcKey::to_bytes(key);
+    context
+        .sql
+        .execute(
+            "UPDATE keypairs SET public_key=?, private_key=?
+             WHERE id=(SELECT value FROM config WHERE keyname='key_id')",
+            (&public_key_bytes, &secret_key_bytes),
+        )
+        .await?;
+    // The public key content changed (fewer advertised subkeys) even though
+    // the fingerprint didn't — drop the cache so the next Autocrypt header
+    // we send reflects it, instead of still advertising a subkey we just
+    // threw the secret half of away.
+    *context.self_public_key.lock().await = None;
     Ok(())
 }
 
