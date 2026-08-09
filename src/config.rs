@@ -508,6 +508,43 @@ pub enum Config {
     /// Recommended values: 30–90 days.  Set to `0` to disable rotation (default).
     #[strum(props(default = "0"))]
     KeyRotationPeriod,
+
+    /// Grace period, in days, before the secret material of a rotated-out
+    /// encryption subkey is permanently forgotten (see
+    /// [`crate::key::maybe_rotate_keypair`] /
+    /// `crate::pgp::forget_expired_encryption_subkeys`).
+    ///
+    /// This window must be long enough for messages already in flight and
+    /// for second devices that have not yet re-synced after a rotation to
+    /// still be able to decrypt — a short grace looks safer on paper but
+    /// breaks multi-device in practice. For that reason, values are always
+    /// clamped to **7–90 days** (hard floor of 7) regardless of what is
+    /// requested, both by `Context::set_config_ex` and by anyone reading
+    /// the raw config directly.
+    ///
+    /// Unset or `<= 0` falls back to the default of 30 days.
+    #[strum(props(default = "30"))]
+    KeyRotationGraceDays,
+}
+
+/// Default for [`Config::KeyRotationGraceDays`] when unset.
+pub(crate) const DEFAULT_KEY_ROTATION_GRACE_DAYS: i64 = 30;
+/// Hard floor for [`Config::KeyRotationGraceDays`]: below this, in-flight
+/// messages and lagging second devices risk losing the ability to decrypt.
+pub(crate) const MIN_KEY_ROTATION_GRACE_DAYS: i64 = 7;
+/// Hard ceiling for [`Config::KeyRotationGraceDays`].
+pub(crate) const MAX_KEY_ROTATION_GRACE_DAYS: i64 = 90;
+
+/// Clamps a requested [`Config::KeyRotationGraceDays`] value to the allowed
+/// **7–90 day** range, falling back to the 30-day default for missing or
+/// non-positive input.
+pub(crate) fn clamp_key_rotation_grace_days(days: i64) -> i64 {
+    let days = if days > 0 {
+        days
+    } else {
+        DEFAULT_KEY_ROTATION_GRACE_DAYS
+    };
+    days.clamp(MIN_KEY_ROTATION_GRACE_DAYS, MAX_KEY_ROTATION_GRACE_DAYS)
 }
 
 impl Config {
@@ -794,6 +831,17 @@ impl Context {
             Config::Displayname => {
                 if let Some(v) = value {
                     better_value = sanitize_single_line(v);
+                    value = Some(&better_value);
+                }
+                self.sql.set_raw_config(key.as_ref(), value).await?;
+            }
+            Config::KeyRotationGraceDays => {
+                // Hard floor/ceiling enforced here so that no caller — UI,
+                // JSON-RPC, or config sync from another device — can push
+                // this below the multi-device-safe minimum.
+                if let Some(v) = value {
+                    let requested: i64 = v.trim().parse().unwrap_or_default();
+                    better_value = clamp_key_rotation_grace_days(requested).to_string();
                     value = Some(&better_value);
                 }
                 self.sql.set_raw_config(key.as_ref(), value).await?;

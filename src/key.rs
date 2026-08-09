@@ -694,7 +694,21 @@ const KEY_ROTATION_ROW_GRACE_DAYS: i64 = 14;
 /// multi-device in practice. Prefer weeks, not days. The forget step also
 /// always retains at least the newest two encryption subkeys regardless of
 /// age (see `MIN_RETAINED_ENCRYPTION_SUBKEYS` in `pgp.rs`).
-const KEY_FORGET_SUBKEY_GRACE_DAYS: i64 = 30;
+///
+/// Configurable via [`Config::KeyRotationGraceDays`] (default 30 days,
+/// clamped to 7–90 — see [`crate::config::clamp_key_rotation_grace_days`]).
+/// [`key_forget_subkey_grace_days`] reads the live, clamped value; this
+/// constant only documents the default and is used in the doc comments
+/// below.
+#[allow(dead_code)]
+const KEY_FORGET_SUBKEY_GRACE_DAYS: i64 = crate::config::DEFAULT_KEY_ROTATION_GRACE_DAYS;
+
+/// Reads [`Config::KeyRotationGraceDays`] and returns it clamped to the
+/// multi-device-safe 7–90 day range, falling back to 30 days if unset.
+async fn key_forget_subkey_grace_days(context: &Context) -> Result<i64> {
+    let raw = i64::from(context.get_config_int(Config::KeyRotationGraceDays).await?);
+    Ok(crate::config::clamp_key_rotation_grace_days(raw))
+}
 
 /// If `Config::KeyRotationPeriod` is set and our current key is older than
 /// that many days, rotates the encryption subkey (or, when switching
@@ -815,7 +829,8 @@ pub(crate) async fn maybe_rotate_keypair(context: &Context) -> Result<()> {
     // 2) Forget encryption-subkey *secrets* embedded in the current key,
     //    but only after the longer multi-device-safe window. The helper
     //    always keeps at least the newest two subkeys regardless of age.
-    let forget_cutoff_secs = now - KEY_FORGET_SUBKEY_GRACE_DAYS * 86_400;
+    let forget_grace_days = key_forget_subkey_grace_days(context).await?;
+    let forget_cutoff_secs = now - forget_grace_days * 86_400;
     let forget_cutoff = UNIX_EPOCH + Duration::from_secs(forget_cutoff_secs.max(0) as u64);
     let current = load_self_secret_key(context).await?;
     let subkeys_before = current.secret_subkeys.len();
@@ -832,7 +847,7 @@ pub(crate) async fn maybe_rotate_keypair(context: &Context) -> Result<()> {
             save_current_keypair(context, &pruned_key).await?;
             info!(
                 context,
-                "Forgot {forgotten} expired encryption subkey(s) past their {KEY_FORGET_SUBKEY_GRACE_DAYS}-day multi-device-safe grace."
+                "Forgot {forgotten} expired encryption subkey(s) past their {forget_grace_days}-day multi-device-safe grace."
             );
         }
     }
