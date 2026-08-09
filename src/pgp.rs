@@ -83,28 +83,39 @@ pub(crate) fn create_keypair(addr: EmailAddress) -> Result<SignedSecretKey> {
 
 /// Creates a post-quantum hybrid keypair (OpenPGP v6).
 ///
-/// Uses hybrid algorithms from draft-ietf-openpgp-pqc:
-/// - **Signing** (primary key): Ed25519 v6 (non-legacy 32-byte format, algorithm 27)
-/// - **Encryption** (subkey): X25519 + ML-KEM-768 hybrid KEM (algorithm 0x1d)
+/// Uses hybrid algorithms from draft-ietf-openpgp-pqc (nearly-final RFC):
+/// - **Signing** (primary key): **ML-DSA-65 + Ed25519** composite
+///   (`KeyType::MlDsa65Ed25519`, OpenPGP algorithm 30). Both components
+///   must verify for the signature to be accepted — classical strength is
+///   never weaker than today, and the ML-DSA part is quantum-resistant.
+/// - **Encryption** (subkey): X25519 + ML-KEM-768 hybrid KEM.
 ///
 /// # Backward compatibility
 ///
-/// Peers that do **not** support PQC (classic OpenPGP clients) fall back to the
-/// X25519 component of the hybrid KEM and can still send encrypted messages.
-/// Decryption by the PQC key holder works in all cases.
+/// - **Encryption**: peers that do not support PQC fall back to the X25519
+///   component of the hybrid KEM and can still send encrypted messages.
+///   Decryption by the PQC key holder works in all cases.
+/// - **Signatures**: classic clients that do not understand ML-DSA-65+Ed25519
+///   will not be able to *verify* our signatures. They can still decrypt
+///   (via X25519) and will treat the message as unsigned / unverified.
+///   PQC-capable peers verify both components.
 ///
-/// PQC signatures protect against harvest-now/decrypt-later attacks on
-/// message authenticity; the hybrid KEM protects confidentiality against
-/// future quantum adversaries.
+/// # Why ML-DSA-65 + Ed25519
+///
+/// - Matches the MUST algorithm in draft-ietf-openpgp-pqc (alg ID 30).
+/// - ~128–192-bit post-quantum security while keeping a classical Ed25519
+///   fallback inside the same composite key.
+/// - Signature size is larger (~3.3 KB) than pure Ed25519 (64 B); this is
+///   the expected cost of quantum-resistant authenticity.
 ///
 /// # Requirement
 ///
 /// The `pgp` crate must be built with `features = ["draft-pqc"]`
 /// (already set in `Cargo.toml`).
 pub(crate) fn create_pqc_keypair(addr: EmailAddress) -> Result<SignedSecretKey> {
-    // v6 Ed25519 for signing — uses 32-byte key material, not the legacy 33-byte
-    // compressed-point format.  Classic receivers verify it fine.
-    let signing_key_type = PgpKeyType::Ed25519;
+    // Composite ML-DSA-65 + Ed25519 for signing (OpenPGP algorithm 30).
+    // Both the lattice and the elliptic-curve signatures must verify.
+    let signing_key_type = PgpKeyType::MlDsa65Ed25519;
 
     // Hybrid ML-KEM-768 + X25519 for encryption.
     // Classic receivers use the X25519 component; PQC-capable receivers use both.
@@ -181,7 +192,7 @@ impl EncryptionKind {
     pub fn label(self) -> &'static str {
         match self {
             EncryptionKind::Classic => "Classic (ECDH/X25519)",
-            EncryptionKind::PostQuantum => "Post-quantum (ML-KEM-768+X25519)",
+            EncryptionKind::PostQuantum => "Post-quantum (ML-DSA-65+Ed25519 / ML-KEM-768+X25519)",
         }
     }
 

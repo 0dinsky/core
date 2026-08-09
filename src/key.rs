@@ -502,13 +502,13 @@ async fn generate_keypair(context: &Context) -> Result<SignedSecretKey> {
 
             // Determine key generation mode:
             //   0 (default) — Classic: Ed25519Legacy + Curve25519 (OpenPGP v4)
-            //   1           — Post-quantum hybrid: Ed25519 v6 + ML-KEM-768+X25519
+            //   1           — Post-quantum hybrid: ML-DSA-65+Ed25519 + ML-KEM-768+X25519
             let key_gen_mode = context.get_config_int(Config::KeyGenMode).await?;
 
             if key_gen_mode == 1 {
                 info!(
                     context,
-                    "Generating post-quantum keypair (v6 Ed25519 + ML-KEM-768+X25519)."
+                    "Generating post-quantum keypair (ML-DSA-65+Ed25519 + ML-KEM-768+X25519)."
                 );
             } else {
                 info!(context, "Generating classic keypair (Ed25519 + Curve25519).");
@@ -631,7 +631,34 @@ pub async fn preconfigure_keypair(context: &Context, secret_data: &str) -> Resul
 /// over, the old secret key is permanently deleted: this is the step that
 /// actually buys forward secrecy, since after that point, not even we can
 /// decrypt what was encrypted to that key anymore.
-const KEY_ROTATION_GRACE_DAYS: i64 = 3;
+///
+/// Default is short (2 days) to tighten the FS window. Configurable via
+/// `Config::KeyRotationGraceDays` so operators can raise it for slow mail
+/// paths or lower it when delivery is reliably fast.
+const KEY_ROTATION_GRACE_DAYS_DEFAULT: i64 = 2;
+
+/// Minimum grace period in days (hard floor so we never erase keys that
+/// are still needed for messages that may still be in flight).
+const KEY_ROTATION_GRACE_DAYS_MIN: i64 = 1;
+
+/// Maximum grace period in days (hard ceiling so old keys cannot linger
+/// forever even if misconfigured).
+const KEY_ROTATION_GRACE_DAYS_MAX: i64 = 14;
+
+/// Returns the effective grace period in days, clamped to
+/// `[KEY_ROTATION_GRACE_DAYS_MIN, KEY_ROTATION_GRACE_DAYS_MAX]`.
+async fn effective_grace_days(context: &Context) -> Result<i64> {
+    let configured = context
+        .get_config_int(Config::KeyRotationGraceDays)
+        .await
+        .unwrap_or(0);
+    let days = if configured > 0 {
+        i64::from(configured)
+    } else {
+        KEY_ROTATION_GRACE_DAYS_DEFAULT
+    };
+    Ok(days.clamp(KEY_ROTATION_GRACE_DAYS_MIN, KEY_ROTATION_GRACE_DAYS_MAX))
+}
 
 /// If `Config::KeyRotationPeriod` is set and our current key is older than
 /// that many days, generates a fresh keypair (same generation mode as the
@@ -639,6 +666,12 @@ const KEY_ROTATION_GRACE_DAYS: i64 = 3;
 /// Also permanently erases any previously-rotated-out key whose grace
 /// period has elapsed, regardless of whether rotation is currently enabled
 /// (so turning rotation off does not leave old keys lying around forever).
+///
+/// ## Speed improvements
+///
+/// - Rotation is checked on every inbox cycle (not only once per daily
+///   housekeeping).
+/// - Grace period is shorter by default (2 days) and configurable.
 ///
 /// ## Caveat: this rotates the whole keypair, not just the encryption subkey
 ///
@@ -680,10 +713,11 @@ pub(crate) async fn maybe_rotate_keypair(context: &Context) -> Result<()> {
             let key_gen_mode = context.get_config_int(Config::KeyGenMode).await?;
             info!(
                 context,
-                "Rotating self key (age {age_days} days >= configured period {period_days} days)."
+                "Rotating self key (age {age_days} days >= configured period {period_days} days, mode={key_gen_mode})."
             );
             let addr = context.get_primary_self_addr().await?;
             let addr = EmailAddress::new(&addr)?;
+            let start = tools::Time::now();
             let new_key = Handle::current()
                 .spawn_blocking(move || {
                     if key_gen_mode == 1 {
@@ -693,13 +727,19 @@ pub(crate) async fn maybe_rotate_keypair(context: &Context) -> Result<()> {
                     }
                 })
                 .await??;
+            info!(
+                context,
+                "Key rotation generation finished in {:.3}s.",
+                time_elapsed(&start).as_secs_f64(),
+            );
             rotate_self_keypair(context, &new_key).await?;
         }
     }
 
     // Erase secret material of any rotated-out key that is past its grace
     // period, whether or not rotation is currently enabled.
-    let cutoff = now - KEY_ROTATION_GRACE_DAYS * 86_400;
+    let grace_days = effective_grace_days(context).await?;
+    let cutoff = now - grace_days * 86_400;
     let deleted = context
         .sql
         .execute(
@@ -713,7 +753,7 @@ pub(crate) async fn maybe_rotate_keypair(context: &Context) -> Result<()> {
     if deleted > 0 {
         info!(
             context,
-            "Erased {deleted} rotated-out keypair(s) past their grace period."
+            "Erased {deleted} rotated-out keypair(s) past their {grace_days}-day grace period."
         );
     }
 
@@ -733,8 +773,9 @@ pub(crate) async fn maybe_rotate_keypair(context: &Context) -> Result<()> {
 /// contacts who have "Verified" this account will see it as unverified
 /// again until they re-verify (e.g. by scanning a fresh QR code). The old
 /// key's secret material is kept for a few more days (see
-/// `KEY_ROTATION_GRACE_DAYS`) so that messages already in flight can still
-/// be decrypted, then permanently erased by [`maybe_rotate_keypair`].
+/// `Config::KeyRotationGraceDays`, default 2 days) so that messages already
+/// in flight can still be decrypted, then permanently erased by
+/// [`maybe_rotate_keypair`].
 pub async fn rotate_keypair_now(context: &Context) -> Result<()> {
     let key_gen_mode = context.get_config_int(Config::KeyGenMode).await?;
     let addr = context.get_primary_self_addr().await?;

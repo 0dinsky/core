@@ -469,12 +469,16 @@ pub enum Config {
     ///
     /// - `0` (default) — **Classic**: Ed25519Legacy + Curve25519 ECDH (OpenPGP v4).
     ///   Maximum compatibility with all OpenPGP clients.
-    /// - `1` — **Post-quantum hybrid** (OpenPGP v6): Ed25519 primary key +
-    ///   ML-KEM-768+X25519 encryption subkey (draft-ietf-openpgp-pqc).
-    ///   Backward-compatible: classic clients fall back to the X25519 KEM component.
+    /// - `1` — **Post-quantum hybrid** (OpenPGP v6):
+    ///   primary key = ML-DSA-65+Ed25519 composite signature,
+    ///   encryption subkey = ML-KEM-768+X25519 hybrid KEM
+    ///   (draft-ietf-openpgp-pqc). Classic clients can still encrypt to us
+    ///   (X25519 fallback) but cannot verify our PQ signatures.
     ///
     /// **Changing this setting only affects the next key generation.**
-    /// Existing keys are not replaced automatically.
+    /// Existing keys are not replaced automatically — call
+    /// `key::rotate_keypair_now` after changing the value if you want an
+    /// immediate switch.
     ///
     /// # Perfect Forward Secrecy
     ///
@@ -483,17 +487,22 @@ pub enum Config {
     ///
     /// OpenPGP-layer PFS is achieved by rotating the whole keypair periodically
     /// via `KeyRotationPeriod`, and permanently erasing each rotated-out key's
-    /// secret material a few days later. After that erasure, compromising the
-    /// current key does not expose messages encrypted to the old, deleted key
-    /// — because that key simply no longer exists anywhere.
+    /// secret material after the grace window (`KeyRotationGraceDays`). After
+    /// that erasure, compromising the current key does not expose messages
+    /// encrypted to the old, deleted key — because that key simply no longer
+    /// exists anywhere.
+    ///
+    /// For best protection against harvest-now-decrypt-later, enable mode `1`
+    /// together with a non-zero `KeyRotationPeriod` (30–60 days is practical).
     #[strum(props(default = "0"))]
     KeyGenMode,
 
     /// Keypair rotation period in days (0 = disabled).
     ///
     /// When non-zero, a fresh keypair is generated and made active every N
-    /// days. The rotated-out key's secret material is kept for a few more
-    /// days (to decrypt messages still in flight), then permanently erased.
+    /// days. The rotated-out key's secret material is kept for the grace
+    /// period (`KeyRotationGraceDays`, default 2 days) to decrypt messages
+    /// still in flight, then permanently erased.
     ///
     /// This provides **partial forward secrecy** at the OpenPGP layer:
     /// compromise of the current key does not expose messages encrypted to
@@ -505,9 +514,19 @@ pub enum Config {
     /// re-verify afterwards. Peers still pick up the new key automatically
     /// via the Autocrypt header on the next message either way.
     ///
-    /// Recommended values: 30–90 days.  Set to `0` to disable rotation (default).
+    /// Recommended values: **30–60 days** for a good FS / UX balance.
+    /// Shorter periods improve FS but force more frequent re-verification.
+    /// Set to `0` to disable rotation (default).
     #[strum(props(default = "0"))]
     KeyRotationPeriod,
+
+    /// Grace period in days after a key is rotated out, before its secret
+    /// material is permanently erased (0 = use library default of 2 days).
+    ///
+    /// Clamped to 1–14 days. Shorter values tighten the forward-secrecy
+    /// window; longer values tolerate very slow or offline mail delivery.
+    #[strum(props(default = "0"))]
+    KeyRotationGraceDays,
 }
 
 impl Config {

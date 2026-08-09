@@ -433,13 +433,16 @@ async fn inbox_fetch_idle(ctx: &Context, imap: &mut Imap, mut session: Session) 
 
     maybe_add_time_based_warnings(ctx).await;
 
+    // Key rotation is cheap to check and important for forward secrecy.
+    // Run it on every inbox cycle rather than only once per daily housekeeping.
+    key::maybe_rotate_keypair(ctx).await.log_err(ctx).ok();
+
     match ctx.get_config_i64(Config::LastHousekeeping).await {
         Ok(last_housekeeping_time) => {
             let next_housekeeping_time =
                 last_housekeeping_time.saturating_add(constants::HOUSEKEEPING_PERIOD);
             if next_housekeeping_time <= time() {
                 sql::housekeeping(ctx).await.log_err(ctx).ok();
-                key::maybe_rotate_keypair(ctx).await.log_err(ctx).ok();
             }
         }
         Err(err) => {
