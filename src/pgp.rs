@@ -273,7 +273,6 @@ pub fn rotate_encryption_subkey(
 ) -> Result<SignedSecretKey> {
     use pgp::composed::SignedSecretSubKey;
     use pgp::packet::KeyFlags;
-    use pgp::types::SecretKeyTrait;
 
     // Generate a temporary keypair solely to obtain a fresh encryption subkey
     // of the desired algorithm family.

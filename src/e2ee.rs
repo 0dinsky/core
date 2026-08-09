@@ -7,9 +7,7 @@ use mail_builder::mime::MimePart;
 
 use crate::aheader::{Aheader, EncryptPreference};
 use crate::context::Context;
-use crate::key::{
-    SignedPublicKey, load_self_public_key, load_self_secret_key, load_signing_secret_key,
-};
+use crate::key::{SignedPublicKey, load_self_public_key, load_signing_secret_key};
 use crate::pgp::{self, SeipdVersion, supports_pq_signatures};
 
 #[derive(Debug)]
