@@ -544,31 +544,22 @@ async fn generate_keypair(context: &Context) -> Result<SignedSecretKey> {
 
             // Determine key generation mode:
             //   0 (default) — Classic: Ed25519Legacy + Curve25519 (OpenPGP v4)
-            //   1           — Post-quantum hybrid: Ed25519 v6 + ML-KEM-768+X25519
+            //   1           — Post-quantum hybrid: ML-DSA-65+Ed25519 + ML-KEM-768+X25519 (OpenPGP v6)
             let key_gen_mode = context.get_config_int(Config::KeyGenMode).await?;
 
             if key_gen_mode == 1 {
                 info!(
                     context,
-                    "Generating PQ keypair (ML-DSA-65+Ed25519 + ML-KEM) plus classic signing fallback."
+                    "Generating PQ keypair (ML-DSA-65+Ed25519 + ML-KEM-768+X25519, OpenPGP v6)."
                 );
-                let addr_c = addr.clone();
-                let classic = Handle::current()
-                    .spawn_blocking(move || crate::pgp::create_keypair(addr_c))
-                    .await??;
-                let public_key = DcKey::to_bytes(&classic.to_public_key());
-                let secret_key = DcKey::to_bytes(&classic);
-                context
-                    .sql
-                    .execute(
-                        "INSERT INTO keypairs (public_key, private_key, created) VALUES (?,?,?)",
-                        (&public_key, &secret_key, tools::time()),
-                    )
-                    .await?;
             } else {
                 info!(context, "Generating classic keypair (Ed25519 + Curve25519).");
             }
 
+            // One keypair only. Previously mode=1 also inserted an orphan classic
+            // key "as fallback" without setting key_id; that left a dead row in
+            // `keypairs` and did not help decryption (the active key is the PQ one).
+            // Classic peers already interoperate via the X25519 half of the hybrid KEM.
             let keypair = Handle::current()
                 .spawn_blocking(move || {
                     if key_gen_mode == 1 {
@@ -677,46 +668,68 @@ pub async fn preconfigure_keypair(context: &Context, secret_data: &str) -> Resul
     Ok(())
 }
 
-/// How long, in days, to keep the secret material of a rotated-out key
-/// (or of an old encryption subkey still embedded in the current key)
-/// around before erasing it for good.
+/// How long, in days, to keep *full keypair rows* that are no longer the
+/// active key, before deleting them from the `keypairs` table.
 ///
-/// This grace period exists so that messages already in flight (e.g. stuck
-/// on a slow relay, or sent by a contact who hasn't fetched our latest
-/// Autocrypt header yet) can still be decrypted. Once the grace period is
-/// over, the old secret material is permanently deleted: this is the step
-/// that actually approximates forward secrecy. OpenPGP has no native PFS;
-/// the combination of subkey rotation + explicit forget is the best
-/// "pretty good forward secrecy" available (see Autocrypt v2 discussions
-/// and the 2026 OpenPGP Email Summit minutes).
+/// These rows are redundant once the current key already embeds the old
+/// encryption subkeys (see `rotate_encryption_subkey`). Deleting them is
+/// relatively safe: decryption still walks the full keyring and the current
+/// key continues to hold the recent subkey secrets until the longer
+/// [`KEY_FORGET_SUBKEY_GRACE_DAYS`] window elapses.
+const KEY_ROTATION_ROW_GRACE_DAYS: i64 = 14;
+
+/// How long, in days, to keep the **secret material** of old encryption
+/// subkeys that are still embedded inside the *current* key, before
+/// permanently forgetting them via
+/// [`crate::pgp::forget_expired_encryption_subkeys`].
 ///
-/// Increasing this value improves decryptability of delayed mail at the
-/// cost of a longer window in which a compromised device can still read
-/// recent past traffic.
-const KEY_ROTATION_GRACE_DAYS: i64 = 3;
+/// This window must be long enough for:
+/// - messages already in flight (slow relays, offline recipients);
+/// - second devices that have not yet been re-synced / re-exported after a
+///   rotation (Autocrypt Setup Message / QR only transfers the *current*
+///   key — if recent subkeys were already forgotten, those devices lose
+///   the ability to decrypt mail encrypted to them).
+///
+/// OpenPGP has no native PFS. A short grace looks good on paper and breaks
+/// multi-device in practice. Prefer weeks, not days. The forget step also
+/// always retains at least the newest two encryption subkeys regardless of
+/// age (see `MIN_RETAINED_ENCRYPTION_SUBKEYS` in `pgp.rs`).
+const KEY_FORGET_SUBKEY_GRACE_DAYS: i64 = 30;
 
 /// If `Config::KeyRotationPeriod` is set and our current key is older than
 /// that many days, rotates the encryption subkey (or, when switching
-/// classic ↔ post-quantum primary, generates a whole new keypair) and
-/// makes the result the active key.
+/// classic ↔ post-quantum primary, generates a whole new keypair) and makes
+/// the result the active key.
 ///
-/// Also permanently erases any previously-rotated-out keypair rows whose
-/// grace period has elapsed, **and** forgets encryption subkeys that are
-/// still embedded inside the *current* key once they are past the same
-/// grace period. The two are not the same thing: `rotate_encryption_subkey`
-/// folds every previous encryption subkey into each new key it produces
-/// (so in-flight messages keep decrypting across a rotation), which means
-/// those old subkeys survive inside the current key indefinitely unless
-/// pruned here explicitly via [`crate::pgp::forget_expired_encryption_subkeys`].
-/// Without that second step, deleting old `keypairs` rows would only
-/// remove redundant snapshots — the current key would still happily
-/// decrypt with arbitrarily old subkey material, silently defeating the
-/// forward-secrecy approximation this function provides.
+/// Also:
+/// 1. Deletes *old keypair rows* past [`KEY_ROTATION_ROW_GRACE_DAYS`].
+/// 2. Forgets encryption-subkey secrets embedded in the *current* key past
+///    [`KEY_FORGET_SUBKEY_GRACE_DAYS`], while always keeping the newest few
+///    (multi-device safety floor).
+///
+/// `rotate_encryption_subkey` folds every previous encryption subkey into
+/// each new key it produces so in-flight messages and lagging second
+/// devices keep decrypting across a rotation. Those old subkeys would
+/// otherwise survive inside the current key forever unless pruned here.
+/// Without the forget step, deleting old `keypairs` rows only removes
+/// redundant snapshots — the current key would still decrypt with
+/// arbitrarily old subkey material.
 ///
 /// When only the encryption subkey is rotated the primary fingerprint
 /// (and therefore Verified status at contacts) stays stable. A full
 /// classic↔PQ primary switch does change the fingerprint and requires
 /// re-verification.
+///
+/// ## Multi-device
+///
+/// Private keys are transferred to a second device via Autocrypt Setup
+/// Message / QR ("Add as second device"). Only the **current** key is
+/// exported. As long as that key still contains recent encryption subkeys,
+/// the second device can decrypt recent history. Aggressive forget would
+/// leave second devices unable to decrypt — do not shorten
+/// [`KEY_FORGET_SUBKEY_GRACE_DAYS`] without a coordinated multi-device key
+/// sync protocol. After a rotation, re-exporting to secondary devices
+/// before the forget window closes keeps them able to read new mail.
 pub(crate) async fn maybe_rotate_keypair(context: &Context) -> Result<()> {
     let now = tools::time();
 
@@ -777,9 +790,11 @@ pub(crate) async fn maybe_rotate_keypair(context: &Context) -> Result<()> {
         }
     }
 
-    // Erase secret material of any rotated-out key that is past its grace
-    // period, whether or not rotation is currently enabled.
-    let cutoff = now - KEY_ROTATION_GRACE_DAYS * 86_400;
+    // 1) Delete old *keypair rows* that are past the shorter row-grace.
+    //    These are full snapshots that became redundant once the current
+    //    key already embeds the previous encryption subkeys. Decryption
+    //    still uses the full keyring + the current key's embedded secrets.
+    let row_cutoff = now - KEY_ROTATION_ROW_GRACE_DAYS * 86_400;
     let deleted = context
         .sql
         .execute(
@@ -787,36 +802,37 @@ pub(crate) async fn maybe_rotate_keypair(context: &Context) -> Result<()> {
              WHERE id != (SELECT value FROM config WHERE keyname='key_id')
                AND created > 0
                AND created < ?",
-            (cutoff,),
+            (row_cutoff,),
         )
         .await?;
     if deleted > 0 {
         info!(
             context,
-            "Erased {deleted} rotated-out keypair(s) past their grace period."
+            "Erased {deleted} rotated-out keypair row(s) past their {KEY_ROTATION_ROW_GRACE_DAYS}-day grace."
         );
     }
 
-    // Forget encryption subkeys embedded *inside the current key* that are
-    // past the same grace period. See the doc comment above: this is a
-    // separate step from the row deletion above and is what actually makes
-    // old subkey material unrecoverable.
-    let cutoff = UNIX_EPOCH + Duration::from_secs(cutoff.max(0) as u64);
+    // 2) Forget encryption-subkey *secrets* embedded in the current key,
+    //    but only after the longer multi-device-safe window. The helper
+    //    always keeps at least the newest two subkeys regardless of age.
+    let forget_cutoff_secs = now - KEY_FORGET_SUBKEY_GRACE_DAYS * 86_400;
+    let forget_cutoff = UNIX_EPOCH + Duration::from_secs(forget_cutoff_secs.max(0) as u64);
     let current = load_self_secret_key(context).await?;
     let subkeys_before = current.secret_subkeys.len();
     let pruned = Handle::current()
-        .spawn_blocking(move || crate::pgp::forget_expired_encryption_subkeys(&current, cutoff))
+        .spawn_blocking(move || {
+            crate::pgp::forget_expired_encryption_subkeys(&current, forget_cutoff)
+        })
         .await?;
-    // An `Err` here just means there was nothing safe to prune yet (e.g. a
-    // single remaining subkey not old enough, or no rotation has happened
-    // yet) — not a real error.
+    // Err = nothing safe to prune yet (under retention floor, still within
+    // grace, or no prior rotation) — not a hard failure.
     if let Ok(pruned_key) = pruned {
         let forgotten = subkeys_before.saturating_sub(pruned_key.secret_subkeys.len());
         if forgotten > 0 {
             save_current_keypair(context, &pruned_key).await?;
             info!(
                 context,
-                "Forgot {forgotten} expired encryption subkey(s) past their grace period."
+                "Forgot {forgotten} expired encryption subkey(s) past their {KEY_FORGET_SUBKEY_GRACE_DAYS}-day multi-device-safe grace."
             );
         }
     }
@@ -833,12 +849,18 @@ pub(crate) async fn maybe_rotate_keypair(context: &Context) -> Result<()> {
 /// take effect for their existing account immediately, rather than only for
 /// the next account they set up or the next scheduled rotation.
 ///
-/// As with any key rotation, this changes the account's fingerprint:
-/// Verified is preserved when only the encryption subkey rotates;
-/// switching classic↔PQ primary still requires re-verify (e.g. by scanning a fresh QR code). The old
-/// key's secret material is kept for a few more days (see
-/// `KEY_ROTATION_GRACE_DAYS`) so that messages already in flight can still
-/// be decrypted, then permanently erased by [`maybe_rotate_keypair`].
+/// When only the encryption subkey is rotated the primary fingerprint (and
+/// Verified status at contacts) stays stable. Switching classic↔PQ primary
+/// still changes the fingerprint and requires re-verify (e.g. by scanning a
+/// fresh QR code).
+///
+/// Old encryption-subkey secrets remain inside the current key for
+/// [`KEY_FORGET_SUBKEY_GRACE_DAYS`] (and at least the newest two are always
+/// retained) so that in-flight mail and second devices that have not yet
+/// been re-exported can still decrypt. Full old keypair rows are dropped
+/// after the shorter [`KEY_ROTATION_ROW_GRACE_DAYS`]. After a rotation,
+/// re-exporting to secondary devices before the forget window closes keeps
+/// multi-device setups able to read new mail.
 pub async fn rotate_keypair_now(context: &Context) -> Result<()> {
     let key_gen_mode = context.get_config_int(Config::KeyGenMode).await?;
     let addr = context.get_primary_self_addr().await?;
@@ -876,8 +898,11 @@ pub async fn rotate_keypair_now(context: &Context) -> Result<()> {
 }
 
 /// Makes `new_key` the active self key, keeping the previously active key
-/// in the `keypairs` table (still usable for decryption) until
-/// [`maybe_rotate_keypair`] erases it after its grace period.
+/// in the `keypairs` table (still usable for decryption via
+/// [`load_self_secret_keyring`]) until [`maybe_rotate_keypair`] deletes the
+/// row after [`KEY_ROTATION_ROW_GRACE_DAYS`]. Encryption-subkey secrets that
+/// were folded into `new_key` by [`crate::pgp::rotate_encryption_subkey`]
+/// remain until the longer [`KEY_FORGET_SUBKEY_GRACE_DAYS`] window.
 async fn rotate_self_keypair(context: &Context, new_key: &SignedSecretKey) -> Result<()> {
     let signed_public_key = new_key.to_public_key();
     let mut config_cache_lock = context.sql.config_cache.write().await;
