@@ -711,9 +711,9 @@ async fn key_forget_subkey_grace_days(context: &Context) -> Result<i64> {
 }
 
 /// If `Config::KeyRotationPeriod` is set and our current key is older than
-/// that many days, rotates the encryption subkey (or, when switching
-/// classic ↔ post-quantum primary, generates a whole new keypair) and makes
-/// the result the active key.
+/// that many days, rotates the encryption subkey (adding or dropping the PQ
+/// hybrid subkey to match `Config::KeyGenMode`) and makes the result the
+/// active key.
 ///
 /// Also:
 /// 1. Deletes *old keypair rows* past [`KEY_ROTATION_ROW_GRACE_DAYS`].
@@ -729,10 +729,11 @@ async fn key_forget_subkey_grace_days(context: &Context) -> Result<i64> {
 /// redundant snapshots — the current key would still decrypt with
 /// arbitrarily old subkey material.
 ///
-/// When only the encryption subkey is rotated the primary fingerprint
-/// (and therefore Verified status at contacts) stays stable. A full
-/// classic↔PQ primary switch does change the fingerprint and requires
-/// re-verification.
+/// This only ever rotates the encryption subkey — the primary fingerprint
+/// (and therefore Verified status at contacts) stays stable, including
+/// across a classic↔PQ `KeyGenMode` toggle. See
+/// [`crate::pgp::create_pqc_keypair`]'s docs for why PQ mode no longer needs
+/// a different primary.
 ///
 /// ## Multi-device
 ///
@@ -776,30 +777,18 @@ pub(crate) async fn maybe_rotate_keypair(context: &Context) -> Result<()> {
             );
             let addr = context.get_primary_self_addr().await?;
             let addr = EmailAddress::new(&addr)?;
-            // Prefer subkey-only rotation so the primary fingerprint (and
-            // Verified status for our contacts) stays stable.
+            // Toggling PQ mode only ever changes which encryption subkeys
+            // are present now (see `create_pqc_keypair`'s docs) — it never
+            // needs a new primary, so this is always a subkey-only
+            // rotation. The primary fingerprint (and Verified status for
+            // our contacts) stays stable either way.
             let current = load_self_secret_key(context).await?;
             let want_pq = key_gen_mode == 1;
-            let current_is_pq = crate::pgp::is_pq_signing_secret(&current);
-            let new_key = if want_pq == current_is_pq {
-                // Same primary family → rotate only encryption subkey.
-                Handle::current()
-                    .spawn_blocking(move || {
-                        crate::pgp::rotate_encryption_subkey(&current, addr, want_pq)
-                    })
-                    .await??
-            } else {
-                // Switching classic ↔ PQ primary: full new keypair (fingerprint changes).
-                Handle::current()
-                    .spawn_blocking(move || {
-                        if want_pq {
-                            crate::pgp::create_pqc_keypair(addr)
-                        } else {
-                            crate::pgp::create_keypair(addr)
-                        }
-                    })
-                    .await??
-            };
+            let new_key = Handle::current()
+                .spawn_blocking(move || {
+                    crate::pgp::rotate_encryption_subkey(&current, addr, want_pq)
+                })
+                .await??;
             rotate_self_keypair(context, &new_key).await?;
         }
     }
@@ -864,10 +853,11 @@ pub(crate) async fn maybe_rotate_keypair(context: &Context) -> Result<()> {
 /// take effect for their existing account immediately, rather than only for
 /// the next account they set up or the next scheduled rotation.
 ///
-/// When only the encryption subkey is rotated the primary fingerprint (and
-/// Verified status at contacts) stays stable. Switching classic↔PQ primary
-/// still changes the fingerprint and requires re-verify (e.g. by scanning a
-/// fresh QR code).
+/// This always rotates only the encryption subkey — see
+/// [`crate::pgp::create_pqc_keypair`]'s docs for why PQ mode no longer needs
+/// a new primary. The primary fingerprint (and Verified status at contacts)
+/// stays stable, including when toggling classic↔PQ; no re-verification is
+/// ever required for this.
 ///
 /// Old encryption-subkey secrets remain inside the current key for
 /// [`KEY_FORGET_SUBKEY_GRACE_DAYS`] (and at least the newest two are always
@@ -886,29 +876,9 @@ pub async fn rotate_keypair_now(context: &Context) -> Result<()> {
     );
     let current = load_self_secret_key(context).await?;
     let want_pq = key_gen_mode == 1;
-    let current_is_pq = crate::pgp::is_pq_signing_secret(&current);
-    let new_key = if want_pq == current_is_pq {
-        Handle::current()
-            .spawn_blocking(move || {
-                crate::pgp::rotate_encryption_subkey(&current, addr, want_pq)
-            })
-            .await??
-    } else {
-        // Mode switch: need a new primary → fingerprint changes, Verified resets.
-        info!(
-            context,
-            "KeyGenMode switch requires new primary key; contacts must re-verify."
-        );
-        Handle::current()
-            .spawn_blocking(move || {
-                if want_pq {
-                    crate::pgp::create_pqc_keypair(addr)
-                } else {
-                    crate::pgp::create_keypair(addr)
-                }
-            })
-            .await??
-    };
+    let new_key = Handle::current()
+        .spawn_blocking(move || crate::pgp::rotate_encryption_subkey(&current, addr, want_pq))
+        .await??;
     rotate_self_keypair(context, &new_key).await
 }
 

@@ -82,41 +82,42 @@ pub(crate) fn create_keypair(addr: EmailAddress) -> Result<SignedSecretKey> {
     Ok(secret_key)
 }
 
-/// Creates a post-quantum hybrid keypair (OpenPGP v6).
+/// Creates a hybrid-PQ keypair: a **classic V4 primary** (Ed25519Legacy signing,
+/// exactly like [`create_keypair`]) plus *two* encryption subkeys — a classic
+/// X25519 one and a ML-KEM-768+X25519 hybrid one (draft-ietf-openpgp-pqc).
 ///
-/// Uses hybrid algorithms from draft-ietf-openpgp-pqc:
-/// - **Signing** (primary key): Ed25519 v6 (non-legacy 32-byte format, algorithm 27)
-/// - **Encryption** (subkey): X25519 + ML-KEM-768 hybrid KEM (algorithm 0x1d)
+/// # Why not a V6 / ML-DSA primary
 ///
-/// # Backward compatibility
+/// An earlier version of this function generated a full OpenPGP v6 primary
+/// with composite ML-DSA-65+Ed25519 signing. That is *not* a graceful
+/// degradation for contacts on non-PQ clients: most OpenPGP implementations
+/// in the wild today cannot even parse a v6 key packet, so such a primary is
+/// invisible to them — not "falls back to classic", but "this contact can no
+/// longer send you encrypted mail at all" (reported as messages silently
+/// never arriving). PQ-resistant *signatures* are a smaller, deferrable win
+/// next to that outage, so this function no longer produces them by default.
 ///
-/// Peers that do **not** support PQC (classic OpenPGP clients) fall back to the
-/// X25519 component of the hybrid KEM and can still send encrypted messages.
-/// Decryption by the PQC key holder works in all cases.
+/// # What this gives you instead
 ///
-/// PQC signatures protect against harvest-now/decrypt-later attacks on
-/// message authenticity; the hybrid KEM protects confidentiality against
-/// future quantum adversaries.
+/// The primary stays V4/Ed25519Legacy, so every OpenPGP client that can read
+/// a normal Delta Chat key today can still read this one and encrypt to it
+/// — using the classic X25519 subkey. Clients that additionally understand
+/// the hybrid ML-KEM-768+X25519 subkey (per draft-ietf-openpgp-pqc) will
+/// pick that one automatically (see [`select_pk_for_encryption`]) for
+/// quantum-resistant confidentiality. Neither side has to know in advance
+/// which the other supports — it negotiates per-message, per-recipient, via
+/// whichever subkeys are actually present on the recipient's key.
 ///
 /// # Requirement
 ///
 /// The `pgp` crate must be built with `features = ["draft-pqc"]`
 /// (already set in `Cargo.toml`).
 pub(crate) fn create_pqc_keypair(addr: EmailAddress) -> Result<SignedSecretKey> {
-    // Composite ML-DSA-65 + Ed25519 for signing — V6-only (draft-pqc / RFC 9980).
-    // Adaptive signing uses this only when all recipients support PQ signatures.
-    let signing_key_type = PgpKeyType::MlDsa65Ed25519;
+    let signing_key_type = PgpKeyType::Ed25519Legacy;
+    let classic_encryption_key_type = PgpKeyType::ECDH(ECCCurve::Curve25519Legacy);
+    let pq_encryption_key_type = PgpKeyType::MlKem768X25519;
 
-    // Hybrid ML-KEM-768 + X25519 for encryption (V6 subkey here; ML-KEM-768+X25519
-    // is also allowed as an encryption subkey of V4 primaries in other paths).
-    let encryption_key_type = PgpKeyType::MlKem768X25519;
-
-    // CRITICAL: MlDsa65Ed25519 is V6-only. Without an explicit KeyVersion::V6
-    // the builder defaults to V4, validation fails at .build(), and generation
-    // aborts — which surfaces in the UI as "cannot generate new key pairs"
-    // when KeyGenMode = 1 (post-quantum).
     let key_params = SecretKeyParamsBuilder::default()
-        .version(KeyVersion::V6)
         .key_type(signing_key_type)
         .can_certify(true)
         .can_sign(true)
@@ -128,28 +129,40 @@ pub(crate) fn create_pqc_keypair(addr: EmailAddress) -> Result<SignedSecretKey> 
             SymmetricKeyAlgorithm::AES192,
             SymmetricKeyAlgorithm::AES128,
         ])
-        // Prefer SHA-3 (natural fit for ML-DSA); keep SHA-2 for compatibility.
         .preferred_hash_algorithms(smallvec![
-            HashAlgorithm::Sha3_256,
-            HashAlgorithm::Sha3_512,
             HashAlgorithm::Sha256,
+            HashAlgorithm::Sha384,
             HashAlgorithm::Sha512,
+            HashAlgorithm::Sha224,
         ])
         .preferred_compression_algorithms(smallvec![
             CompressionAlgorithm::ZLIB,
             CompressionAlgorithm::ZIP,
         ])
+        // Classic subkey listed first: any (non-compliant) client that just
+        // grabs the first encrypt-capable subkey it sees, instead of
+        // checking which algorithms it actually supports, still gets one it
+        // can use. Our own selection ([`select_pk_for_encryption`]) doesn't
+        // depend on this order — it explicitly prefers the PQ subkey when
+        // present, regardless of position.
         .subkey(
             SubkeyParamsBuilder::default()
-                .version(KeyVersion::V6)
-                .key_type(encryption_key_type)
+                .key_type(classic_encryption_key_type)
+                .can_encrypt(EncryptionCaps::All)
+                .passphrase(None)
+                .build()
+                .context("failed to build classic fallback subkey parameters")?,
+        )
+        .subkey(
+            SubkeyParamsBuilder::default()
+                .key_type(pq_encryption_key_type)
                 .can_encrypt(EncryptionCaps::All)
                 .passphrase(None)
                 .build()
                 .context("failed to build PQC subkey parameters")?,
         )
         .build()
-        .context("failed to build PQC key parameters (need KeyVersion::V6 for ML-DSA)")?;
+        .context("failed to build PQC key parameters")?;
 
     let mut rng = thread_rng();
     let secret_key = key_params
@@ -162,15 +175,30 @@ pub(crate) fn create_pqc_keypair(addr: EmailAddress) -> Result<SignedSecretKey> 
     Ok(secret_key)
 }
 
-/// Selects a subkey of the public key to use for encryption.
+/// Selects a subkey of the public key to use for encryption: prefers a
+/// post-quantum hybrid subkey (ML-KEM-768+X25519 / ML-KEM-1024+X448) if the
+/// key has one, otherwise falls back to the first classic encryption-capable
+/// subkey. This is what makes PQ encryption "just work" only between parties
+/// whose keys both carry a PQ subkey, with automatic per-recipient fallback
+/// to classic otherwise — no coordination or setting needed on either side.
 ///
 /// Returns `None` if the public key cannot be used for encryption.
 ///
 /// TODO: take key flags and expiration dates into account
 fn select_pk_for_encryption(key: &SignedPublicKey) -> Option<&SignedPublicSubKey> {
-    key.public_subkeys
-        .iter()
-        .find(|subkey| subkey.algorithm().can_encrypt())
+    let mut fallback: Option<&SignedPublicSubKey> = None;
+    for subkey in key.public_subkeys.iter() {
+        if !subkey.algorithm().can_encrypt() {
+            continue;
+        }
+        if classify_encryption_algorithm(subkey.algorithm()) == EncryptionKind::PostQuantum {
+            return Some(subkey);
+        }
+        if fallback.is_none() {
+            fallback = Some(subkey);
+        }
+    }
+    fallback
 }
 
 /// Coarse classification of the algorithm family behind a key's chosen
@@ -254,6 +282,12 @@ pub fn supports_pq_signatures(key: &SignedPublicKey) -> bool {
 }
 
 /// True if the secret key primary is a PQ signing key.
+///
+/// Note: [`create_pqc_keypair`] no longer produces one of these (it keeps a
+/// classic Ed25519Legacy primary and adds a PQ *encryption* subkey instead —
+/// see that function's docs for why). This stays around in case a key was
+/// migrated to a full PQ-signing primary some other way; for "does this key
+/// currently do PQ encryption", use [`has_pq_encryption_subkey`] instead.
 pub fn is_pq_signing_secret(key: &SignedSecretKey) -> bool {
     use pgp::crypto::public_key::PublicKeyAlgorithm;
     matches!(
@@ -264,6 +298,23 @@ pub fn is_pq_signing_secret(key: &SignedSecretKey) -> bool {
             | PublicKeyAlgorithm::SlhDsaShake128f
             | PublicKeyAlgorithm::SlhDsaShake256s
     )
+}
+
+/// True if this secret key currently carries a post-quantum hybrid
+/// encryption subkey (ML-KEM-768+X25519 / ML-KEM-1024+X448) — i.e. contacts
+/// whose clients understand it can already encrypt PQ-hybrid messages to
+/// this key, regardless of the primary key's own algorithm or version.
+///
+/// This is the signal [`crate::key::maybe_rotate_keypair`] and
+/// [`crate::key::rotate_keypair_now`] use to decide whether a PQ-mode
+/// rotation needs to *add* a PQ subkey or is already a no-op — deliberately
+/// independent of [`is_pq_signing_secret`], since toggling
+/// `Config::KeyGenMode` only ever changes the encryption subkey set now, not
+/// the primary.
+pub fn has_pq_encryption_subkey(key: &SignedSecretKey) -> bool {
+    key.public_subkeys
+        .iter()
+        .any(|subkey| classify_encryption_algorithm(subkey.algorithm()) == EncryptionKind::PostQuantum)
 }
 
 /// Build a throwaway keypair whose single purpose is to donate a fresh
@@ -939,6 +990,47 @@ mod tests {
         let keypair0 = create_keypair(EmailAddress::new("foo@bar.de").unwrap()).unwrap();
         let keypair1 = create_keypair(EmailAddress::new("two@zwo.de").unwrap()).unwrap();
         assert_ne!(keypair0.public_key(), keypair1.public_key());
+    }
+
+    /// `create_pqc_keypair` must produce a **V4** primary (so any classic
+    /// OpenPGP client can still parse and encrypt to it) carrying *two*
+    /// encryption subkeys: one classic, one PQ hybrid. This is what lets PQ
+    /// contacts get PQ encryption while non-PQ contacts keep working
+    /// unmodified — see the function's doc comment for the full rationale.
+    #[test]
+    fn test_create_pqc_keypair_is_v4_primary_with_dual_subkeys() {
+        let keypair = create_pqc_keypair(EmailAddress::new("pq@example.org").unwrap()).unwrap();
+
+        assert_eq!(keypair.primary_key.version(), KeyVersion::V4);
+        assert!(!is_pq_signing_secret(&keypair), "primary must stay classic");
+
+        let encrypt_subkeys: Vec<_> = keypair
+            .public_subkeys
+            .iter()
+            .filter(|sk| sk.algorithm().can_encrypt())
+            .collect();
+        assert_eq!(encrypt_subkeys.len(), 2, "want one classic + one PQ subkey");
+        assert!(
+            encrypt_subkeys
+                .iter()
+                .any(|sk| classify_encryption_algorithm(sk.algorithm()) == EncryptionKind::Classic)
+        );
+        assert!(has_pq_encryption_subkey(&keypair));
+
+        // Our own selection must prefer the PQ subkey when both are present.
+        let public_key = keypair.to_public_key();
+        assert_eq!(encryption_kind(&public_key), Some(EncryptionKind::PostQuantum));
+    }
+
+    /// A contact whose key has *no* PQ subkey (e.g. a plain classic key)
+    /// must still resolve to classic encryption — the whole point of the
+    /// dual-subkey design is that PQ activates only when the recipient's
+    /// own key advertises it, with no explicit negotiation needed.
+    #[test]
+    fn test_select_pk_for_encryption_falls_back_to_classic() {
+        let classic = create_keypair(EmailAddress::new("classic@example.org").unwrap()).unwrap();
+        let public_key = classic.to_public_key();
+        assert_eq!(encryption_kind(&public_key), Some(EncryptionKind::Classic));
     }
 
     /// [SignedSecretKey] and [SignedPublicKey] objects
