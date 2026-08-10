@@ -441,6 +441,19 @@ impl MimeMessage {
             None
         };
 
+        // Import `_pq_signing=1` before signature verification (first dual-sign msg).
+        if is_encrypted {
+            if let Ok(ref decrypted_mail) = mail {
+                for value in decrypted_mail.headers.get_all_values("Autocrypt-Gossip") {
+                    if let Ok(header) = Aheader::from_str(&value) {
+                        if header.pq_signing && addr_cmp(&from.addr, &header.addr) {
+                            let _ = import_public_key(context, &header.public_key).await;
+                        }
+                    }
+                }
+            }
+        }
+
         let mut public_keyring = if from_is_not_self_addr {
             if let Some(autocrypt_header) = autocrypt_header {
                 vec![autocrypt_header.public_key]
@@ -2122,6 +2135,8 @@ async fn parse_gossip_headers(
                 continue;
             }
         };
+
+        if header.pq_signing { continue; }
 
         if !recipients
             .iter()

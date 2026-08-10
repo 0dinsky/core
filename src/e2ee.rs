@@ -8,7 +8,7 @@ use mail_builder::mime::MimePart;
 use crate::aheader::{Aheader, EncryptPreference};
 use crate::context::Context;
 use crate::key::{SignedPublicKey, load_self_public_key, load_signing_secret_key};
-use crate::pgp::{self, SeipdVersion, supports_pq_signatures};
+use crate::pgp::{self, SeipdVersion, supports_pq_encryption};
 
 #[derive(Debug)]
 pub struct EncryptHelper {
@@ -30,6 +30,7 @@ impl EncryptHelper {
             public_key: self.public_key.clone(),
             prefer_encrypt: EncryptPreference::Mutual,
             verified: false,
+            pq_signing: false,
         }
     }
 
@@ -60,12 +61,15 @@ impl EncryptHelper {
         compress: bool,
         seipd_version: SeipdVersion,
     ) -> Result<String> {
-        // Adaptive signatures: PQ only if every recipient can verify it.
-        let prefer_pq = !keyring.is_empty() && keyring.iter().all(supports_pq_signatures);
-        let sign_key = load_signing_secret_key(context, prefer_pq).await?;
-        let ctext =
-            pgp::pk_encrypt(raw_message, keyring, sign_key, compress, seipd_version).await?;
-
+        // Always classic identity signature (default Delta Chat compatible).
+        // Extra ML-DSA only if EVERY recipient has PQ encryption subkey.
+        let all_pq = !keyring.is_empty() && keyring.iter().all(supports_pq_encryption);
+        let classic = load_signing_secret_key(context, false).await?;
+        let pq = if all_pq {
+            let k = load_signing_secret_key(context, true).await?;
+            if crate::pgp::is_pq_signing_secret(&k) { Some(k) } else { None }
+        } else { None };
+        let ctext = pgp::pk_encrypt(raw_message, keyring, classic, pq, compress, seipd_version).await?;
         Ok(ctext)
     }
 

@@ -609,6 +609,7 @@ async fn import_self_keys(context: &Context, path: &Path) -> Result<()> {
             path.display()
         );
         import_secret_key(context, path).await?;
+        crate::key::maybe_ensure_pq_signing_key(context).await?;
         return Ok(());
     }
 
@@ -649,6 +650,7 @@ async fn import_self_keys(context: &Context, path: &Path) -> Result<()> {
         "No private keys found in {}.",
         path.display()
     );
+    crate::key::maybe_ensure_pq_signing_key(context).await?;
     Ok(())
 }
 

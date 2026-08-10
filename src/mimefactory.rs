@@ -1102,6 +1102,7 @@ impl MimeFactory {
                                 // `prefer-encrypt` attribute SHOULD NOT be included.
                                 prefer_encrypt: EncryptPreference::NoPreference,
                                 verified: is_verified,
+                                pq_signing: false,
                             }
                             .to_string();
 
@@ -1125,6 +1126,27 @@ impl MimeFactory {
                 }
                 Loaded::Mdn { .. } => {
                     // Never gossip in MDNs.
+                }
+            }
+
+            // Only all-PQ recipients get our ML-DSA public key / dual-sign material.
+            if encryption_pubkeys
+                .iter()
+                .all(|(_addr, key)| crate::pgp::supports_pq_encryption(key))
+            {
+                if let Ok(Some(pq_pub)) = crate::key::load_pq_signing_public_key(context).await {
+                    let header = Aheader {
+                        addr: self.from_addr.clone(),
+                        public_key: pq_pub,
+                        prefer_encrypt: EncryptPreference::NoPreference,
+                        verified: false,
+                        pq_signing: true,
+                    }
+                    .to_string();
+                    message = message.header(
+                        "Autocrypt-Gossip",
+                        mail_builder::headers::raw::Raw::new(header),
+                    );
                 }
             }
 

@@ -1168,6 +1168,7 @@ Content-Transfer-Encoding: base64\r
             plain_text.as_bytes().to_vec(),
             public_keys_for_encryption,
             alice_secret_key,
+            None,
             compress,
             SeipdVersion::V2,
         )

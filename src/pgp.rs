@@ -175,6 +175,49 @@ pub(crate) fn create_pqc_keypair(addr: EmailAddress) -> Result<SignedSecretKey> 
     Ok(secret_key)
 }
 
+/// Dedicated V6 ML-DSA signing key (NOT Autocrypt identity).
+/// Used only as an extra signature when every recipient supports PQ encryption.
+pub(crate) fn create_pq_signing_keypair(addr: EmailAddress) -> Result<SignedSecretKey> {
+    let key_params = SecretKeyParamsBuilder::default()
+        .version(KeyVersion::V6)
+        .key_type(PgpKeyType::MlDsa65Ed25519)
+        .can_certify(true)
+        .can_sign(true)
+        .feature_seipd_v2(true)
+        .primary_user_id(format!("<{addr}>"))
+        .passphrase(None)
+        .preferred_symmetric_algorithms(smallvec![
+            SymmetricKeyAlgorithm::AES256,
+            SymmetricKeyAlgorithm::AES192,
+            SymmetricKeyAlgorithm::AES128,
+        ])
+        .preferred_hash_algorithms(smallvec![
+            HashAlgorithm::Sha256,
+            HashAlgorithm::Sha384,
+            HashAlgorithm::Sha512,
+            HashAlgorithm::Sha224,
+        ])
+        .preferred_compression_algorithms(smallvec![
+            CompressionAlgorithm::ZLIB,
+            CompressionAlgorithm::ZIP,
+        ])
+        .subkey(
+            SubkeyParamsBuilder::default()
+                .version(KeyVersion::V6)
+                .key_type(PgpKeyType::MlKem768X25519)
+                .can_encrypt(EncryptionCaps::All)
+                .passphrase(None)
+                .build()
+                .context("failed to build PQ signing enc subkey")?,
+        )
+        .build()
+        .context("failed to build PQ signing key params")?;
+    let mut rng = thread_rng();
+    let secret_key = key_params.generate(&mut rng).context("Failed to generate PQ signing key")?;
+    secret_key.verify_bindings().context("Invalid PQ signing key")?;
+    Ok(secret_key)
+}
+
 /// Selects a subkey of the public key to use for encryption: prefers a
 /// post-quantum hybrid subkey (ML-KEM-768+X25519 / ML-KEM-1024+X448) if the
 /// key has one, otherwise falls back to the first classic encryption-capable
@@ -281,13 +324,12 @@ pub fn supports_pq_signatures(key: &SignedPublicKey) -> bool {
     )
 }
 
-/// True if the secret key primary is a PQ signing key.
-///
-/// Note: [`create_pqc_keypair`] no longer produces one of these (it keeps a
-/// classic Ed25519Legacy primary and adds a PQ *encryption* subkey instead —
-/// see that function's docs for why). This stays around in case a key was
-/// migrated to a full PQ-signing primary some other way; for "does this key
-/// currently do PQ encryption", use [`has_pq_encryption_subkey`] instead.
+/// Recipient has ML-KEM hybrid encryption subkey — gate for dual-sign.
+pub fn supports_pq_encryption(key: &SignedPublicKey) -> bool {
+    encryption_kind(key) == Some(EncryptionKind::PostQuantum)
+}
+
+/// True if secret primary is PQ signing (from [`create_pq_signing_keypair`]).
 pub fn is_pq_signing_secret(key: &SignedSecretKey) -> bool {
     use pgp::crypto::public_key::PublicKeyAlgorithm;
     matches!(
@@ -560,90 +602,89 @@ pub enum SeipdVersion {
 /// Encrypts `plain` text using `public_keys_for_encryption`
 /// and signs it using `private_key_for_signing`.
 #[expect(clippy::arithmetic_side_effects)]
+fn signature_subpackets(
+    private_key_for_signing: &SignedSecretKey,
+    public_keys_for_encryption: &[SignedPublicKey],
+) -> Result<SubpacketConfig> {
+    let mut hashed = Vec::with_capacity(1 + public_keys_for_encryption.len() + 1);
+    hashed.push(Subpacket::critical(SubpacketData::SignatureCreationTime(
+        pgp::types::Timestamp::now(),
+    ))?);
+    for key in public_keys_for_encryption {
+        let data = SubpacketData::IntendedRecipientFingerprint(key.fingerprint());
+        let subpkt = match private_key_for_signing.version() < KeyVersion::V6 {
+            true => Subpacket::regular(data)?,
+            false => Subpacket::critical(data)?,
+        };
+        hashed.push(subpkt);
+    }
+    hashed.push(Subpacket::regular(SubpacketData::IssuerFingerprint(
+        private_key_for_signing.fingerprint(),
+    ))?);
+    let mut unhashed = vec![];
+    if private_key_for_signing.version() <= KeyVersion::V4 {
+        unhashed.push(Subpacket::regular(SubpacketData::IssuerKeyId(
+            private_key_for_signing.legacy_key_id(),
+        ))?);
+    }
+    Ok(SubpacketConfig::UserDefined { hashed, unhashed })
+}
+
+/// Always classic identity signature. Optional second PQ signature only when
+/// every recipient is PQ-capable — classic Delta Chat never sees ML-DSA packets.
 pub async fn pk_encrypt(
     plain: Vec<u8>,
     public_keys_for_encryption: Vec<SignedPublicKey>,
     private_key_for_signing: SignedSecretKey,
+    extra_pq_signing_key: Option<SignedSecretKey>,
     compress: bool,
     seipd_version: SeipdVersion,
 ) -> Result<String> {
     Handle::current()
         .spawn_blocking(move || {
             let mut rng = thread_rng();
-
-            let pkeys = public_keys_for_encryption
+            let pkeys: Vec<_> = public_keys_for_encryption
                 .iter()
-                .filter_map(select_pk_for_encryption);
-            let subpkts = {
-                let mut hashed = Vec::with_capacity(1 + public_keys_for_encryption.len() + 1);
-                hashed.push(Subpacket::critical(SubpacketData::SignatureCreationTime(
-                    pgp::types::Timestamp::now(),
-                ))?);
-                for key in &public_keys_for_encryption {
-                    let data = SubpacketData::IntendedRecipientFingerprint(key.fingerprint());
-                    let subpkt = match private_key_for_signing.version() < KeyVersion::V6 {
-                        true => Subpacket::regular(data)?,
-                        false => Subpacket::critical(data)?,
-                    };
-                    hashed.push(subpkt);
-                }
-                hashed.push(Subpacket::regular(SubpacketData::IssuerFingerprint(
-                    private_key_for_signing.fingerprint(),
-                ))?);
-                let mut unhashed = vec![];
-                if private_key_for_signing.version() <= KeyVersion::V4 {
-                    unhashed.push(Subpacket::regular(SubpacketData::IssuerKeyId(
-                        private_key_for_signing.legacy_key_id(),
-                    ))?);
-                }
-                SubpacketConfig::UserDefined { hashed, unhashed }
-            };
-
+                .filter_map(select_pk_for_encryption)
+                .collect();
+            let classic_subpkts =
+                signature_subpackets(&private_key_for_signing, &public_keys_for_encryption)?;
+            let pq_subpkts = extra_pq_signing_key
+                .as_ref()
+                .map(|k| signature_subpackets(k, &public_keys_for_encryption))
+                .transpose()?;
             let msg = MessageBuilder::from_bytes("", plain);
             let encoded_msg = match seipd_version {
                 SeipdVersion::V1 => {
                     let mut msg = msg.seipd_v1(&mut rng, SYMMETRIC_KEY_ALGORITHM);
-
-                    for pkey in pkeys {
-                        msg.encrypt_to_key_anonymous(&mut rng, &pkey)?;
+                    for pkey in &pkeys {
+                        msg.encrypt_to_key_anonymous(&mut rng, pkey)?;
                     }
-
-                    let hash_algorithm = private_key_for_signing.hash_alg();
                     msg.sign_with_subpackets(
-                        &*private_key_for_signing,
-                        Password::empty(),
-                        hash_algorithm,
-                        subpkts,
+                        &*private_key_for_signing, Password::empty(),
+                        private_key_for_signing.hash_alg(), classic_subpkts,
                     );
-                    if compress {
-                        msg.compression(CompressionAlgorithm::ZLIB);
+                    if let (Some(pq_key), Some(subpkts)) = (extra_pq_signing_key.as_ref(), pq_subpkts) {
+                        msg.sign_with_subpackets(&**pq_key, Password::empty(), pq_key.hash_alg(), subpkts);
                     }
-
+                    if compress { msg.compression(CompressionAlgorithm::ZLIB); }
                     msg.to_armored_string(&mut rng, Default::default())?
                 }
                 SeipdVersion::V2 => {
                     let mut msg = msg.seipd_v2(
-                        &mut rng,
-                        SYMMETRIC_KEY_ALGORITHM,
-                        AeadAlgorithm::Ocb,
-                        ChunkSize::C8KiB,
+                        &mut rng, SYMMETRIC_KEY_ALGORITHM, AeadAlgorithm::Ocb, ChunkSize::C8KiB,
                     );
-
-                    for pkey in pkeys {
-                        msg.encrypt_to_key_anonymous(&mut rng, &pkey)?;
+                    for pkey in &pkeys {
+                        msg.encrypt_to_key_anonymous(&mut rng, pkey)?;
                     }
-
-                    let hash_algorithm = private_key_for_signing.hash_alg();
                     msg.sign_with_subpackets(
-                        &*private_key_for_signing,
-                        Password::empty(),
-                        hash_algorithm,
-                        subpkts,
+                        &*private_key_for_signing, Password::empty(),
+                        private_key_for_signing.hash_alg(), classic_subpkts,
                     );
-                    if compress {
-                        msg.compression(CompressionAlgorithm::ZLIB);
+                    if let (Some(pq_key), Some(subpkts)) = (extra_pq_signing_key.as_ref(), pq_subpkts) {
+                        msg.sign_with_subpackets(&**pq_key, Password::empty(), pq_key.hash_alg(), subpkts);
                     }
-
+                    if compress { msg.compression(CompressionAlgorithm::ZLIB); }
                     msg.to_armored_string(&mut rng, Default::default())?
                 }
             };
@@ -1074,6 +1115,7 @@ mod tests {
                     CLEARTEXT.to_vec(),
                     keyring,
                     KEYS.alice_secret.clone(),
+                    None,
                     compress,
                     SeipdVersion::V2,
                 )
@@ -1266,6 +1308,7 @@ mod tests {
             plain,
             vec![pk_for_encryption],
             KEYS.alice_secret.clone(),
+            None,
             compress,
             SeipdVersion::V2,
         )

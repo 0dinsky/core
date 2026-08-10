@@ -542,40 +542,25 @@ async fn generate_keypair(context: &Context) -> Result<SignedSecretKey> {
         None => {
             let start = tools::Time::now();
 
-            // Determine key generation mode:
-            //   0 (default) — Classic: Ed25519Legacy + Curve25519 (OpenPGP v4)
-            //   1           — Post-quantum hybrid: ML-DSA-65+Ed25519 + ML-KEM-768+X25519 (OpenPGP v6)
+            // 0=classic; 1=classic primary+ML-KEM Autocrypt + dedicated V6 ML-DSA signing key
             let key_gen_mode = context.get_config_int(Config::KeyGenMode).await?;
-
             if key_gen_mode == 1 {
-                info!(
-                    context,
-                    "Generating PQ keypair (ML-DSA-65+Ed25519 + ML-KEM-768+X25519, OpenPGP v6)."
-                );
+                info!(context, "Generating hybrid Autocrypt key + dedicated PQ signing key.");
             } else {
                 info!(context, "Generating classic keypair (Ed25519 + Curve25519).");
             }
-
-            // One keypair only. Previously mode=1 also inserted an orphan classic
-            // key "as fallback" without setting key_id; that left a dead row in
-            // `keypairs` and did not help decryption (the active key is the PQ one).
-            // Classic peers already interoperate via the X25519 half of the hybrid KEM.
+            let addr_for_signing = addr.clone();
             let keypair = Handle::current()
                 .spawn_blocking(move || {
-                    if key_gen_mode == 1 {
-                        crate::pgp::create_pqc_keypair(addr)
-                    } else {
-                        crate::pgp::create_keypair(addr)
-                    }
+                    if key_gen_mode == 1 { crate::pgp::create_pqc_keypair(addr) }
+                    else { crate::pgp::create_keypair(addr) }
                 })
                 .await??;
-
             store_self_keypair(context, &keypair).await?;
-            info!(
-                context,
-                "Keypair generated in {:.3}s.",
-                time_elapsed(&start).as_secs(),
-            );
+            if key_gen_mode == 1 {
+                ensure_pq_signing_key(context, addr_for_signing).await?;
+            }
+            info!(context, "Keypair generated in {:.3}s.", time_elapsed(&start).as_secs());
             Ok(keypair)
         }
     }
@@ -655,6 +640,65 @@ pub(crate) async fn store_self_keypair(
     context.emit_event(EventType::AccountsItemChanged);
     config_cache_lock.insert("key_id".to_string(), Some(new_key_id.to_string()));
     Ok(())
+}
+
+
+async fn store_additional_keypair(context: &Context, signed_secret_key: &SignedSecretKey) -> Result<i64> {
+    let signed_public_key = signed_secret_key.to_public_key();
+    context.sql.transaction(|transaction| {
+        let public_key = DcKey::to_bytes(&signed_public_key);
+        let secret_key = DcKey::to_bytes(signed_secret_key);
+        transaction.execute(
+            "INSERT INTO keypairs (public_key, private_key, created) VALUES (?,?,?)",
+            (&public_key, &secret_key, tools::time()),
+        ).context("Failed to insert additional keypair")?;
+        Ok(transaction.last_insert_rowid())
+    }).await
+}
+
+pub(crate) async fn ensure_pq_signing_key(context: &Context, addr: EmailAddress) -> Result<()> {
+    let keys = load_self_secret_keyring(context).await?;
+    if keys.iter().any(crate::pgp::is_pq_signing_secret) {
+        if context.sql.get_raw_config_int64("pq_signing_key_id").await?.is_none() {
+            for key in &keys {
+                if crate::pgp::is_pq_signing_secret(key) {
+                    let bytes = DcKey::to_bytes(key);
+                    if let Some(id) = context.sql.query_get_value::<i64>(
+                        "SELECT id FROM keypairs WHERE private_key=?", (bytes,),
+                    ).await? {
+                        context.sql.set_raw_config("pq_signing_key_id", Some(&id.to_string())).await?;
+                    }
+                    break;
+                }
+            }
+        }
+        return Ok(());
+    }
+    info!(context, "Generating dedicated PQ signing key (ML-DSA-65+Ed25519, V6).");
+    let pq_key = Handle::current()
+        .spawn_blocking(move || crate::pgp::create_pq_signing_keypair(addr))
+        .await??;
+    let key_id = store_additional_keypair(context, &pq_key).await?;
+    context.sql.set_raw_config("pq_signing_key_id", Some(&key_id.to_string())).await?;
+    let _ = crate::contact::import_public_key(context, &pq_key.to_public_key()).await;
+    info!(context, "PQ signing key stored (id={key_id}).");
+    Ok(())
+}
+
+pub(crate) async fn maybe_ensure_pq_signing_key(context: &Context) -> Result<()> {
+    if context.get_config_int(Config::KeyGenMode).await? != 1 { return Ok(()); }
+    let addr = context.get_primary_self_addr().await?;
+    let Ok(addr) = EmailAddress::new(&addr) else { return Ok(()); };
+    ensure_pq_signing_key(context, addr).await
+}
+
+pub(crate) async fn load_pq_signing_public_key(context: &Context) -> Result<Option<SignedPublicKey>> {
+    for key in load_self_secret_keyring(context).await? {
+        if crate::pgp::is_pq_signing_secret(&key) {
+            return Ok(Some(key.to_public_key()));
+        }
+    }
+    Ok(None)
 }
 
 /// Saves a keypair as the default keys.
@@ -803,6 +847,7 @@ pub(crate) async fn maybe_rotate_keypair(context: &Context) -> Result<()> {
         .execute(
             "DELETE FROM keypairs
              WHERE id != (SELECT value FROM config WHERE keyname='key_id')
+               AND id != IFNULL((SELECT value FROM config WHERE keyname='pq_signing_key_id'), -1)
                AND created > 0
                AND created < ?",
             (row_cutoff,),
@@ -840,7 +885,7 @@ pub(crate) async fn maybe_rotate_keypair(context: &Context) -> Result<()> {
             );
         }
     }
-
+    maybe_ensure_pq_signing_key(context).await?;
     Ok(())
 }
 
@@ -879,7 +924,9 @@ pub async fn rotate_keypair_now(context: &Context) -> Result<()> {
     let new_key = Handle::current()
         .spawn_blocking(move || crate::pgp::rotate_encryption_subkey(&current, addr, want_pq))
         .await??;
-    rotate_self_keypair(context, &new_key).await
+    rotate_self_keypair(context, &new_key).await?;
+    maybe_ensure_pq_signing_key(context).await?;
+    Ok(())
 }
 
 /// Makes `new_key` the active self key, keeping the previously active key
