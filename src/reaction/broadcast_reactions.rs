@@ -80,7 +80,7 @@ pub(crate) async fn render_json(context: &Context, msg_ids: &[MsgId]) -> Result<
 }
 
 /// Emojis allowed as reactions in broadcast channels.
-const ALLOWED_REACTIONS: [&str; 5] = ["👍", "👎", "❤️", "😂", "🙁"];
+const ALLOWED_REACTIONS: [&str; 5] = ["👍", "❤️", "😂", "🎉", "😢"];
 
 /// Check if a reaction is an allowed reaction in a broadcast channel.
 pub(crate) fn is_allowed_reaction(reaction: &Reaction) -> bool {
