@@ -1,112 +1,9 @@
 //! End-to-end encryption support.
 
-use std::io::Cursor;
-
-use anyhow::Result;
-use mail_builder::mime::MimePart;
-
-use crate::aheader::{Aheader, EncryptPreference};
-use crate::context::Context;
-use crate::key::{SignedPublicKey, load_self_public_key, load_signing_secret_key};
-use crate::pgp::{self, SeipdVersion, supports_pq_encryption};
-
-#[derive(Debug)]
-pub struct EncryptHelper {
-    pub addr: String,
-    pub public_key: SignedPublicKey,
-}
-
-impl EncryptHelper {
-    pub async fn new(context: &Context) -> Result<EncryptHelper> {
-        let addr = context.get_primary_self_addr().await?;
-        let public_key = load_self_public_key(context).await?;
-
-        Ok(EncryptHelper { addr, public_key })
-    }
-
-    pub fn get_aheader(&self) -> Aheader {
-        Aheader {
-            addr: self.addr.clone(),
-            public_key: self.public_key.clone(),
-            prefer_encrypt: EncryptPreference::Mutual,
-            verified: false,
-            pq_signing: false,
-        }
-    }
-
-    /// Tries to encrypt the passed in `mail`.
-    pub async fn encrypt(
-        self,
-        context: &Context,
-        keyring: Vec<SignedPublicKey>,
-        mail_to_encrypt: MimePart<'static>,
-        compress: bool,
-        seipd_version: SeipdVersion,
-    ) -> Result<String> {
-        let mut raw_message = Vec::new();
-        let cursor = Cursor::new(&mut raw_message);
-        mail_to_encrypt.clone().write_part(cursor).ok();
-
-        let ctext = self
-            .encrypt_raw(context, keyring, raw_message, compress, seipd_version)
-            .await?;
-        Ok(ctext)
-    }
-
-    pub async fn encrypt_raw(
-        self,
-        context: &Context,
-        keyring: Vec<SignedPublicKey>,
-        raw_message: Vec<u8>,
-        compress: bool,
-        seipd_version: SeipdVersion,
-    ) -> Result<String> {
-        // Always classic identity signature (default Delta Chat compatible).
-        // Extra ML-DSA only if EVERY recipient has PQ encryption subkey.
-        let all_pq = !keyring.is_empty() && keyring.iter().all(supports_pq_encryption);
-        let classic = load_signing_secret_key(context, false).await?;
-        let pq = if all_pq {
-            let k = load_signing_secret_key(context, true).await?;
-            if crate::pgp::is_pq_signing_secret(&k) { Some(k) } else { None }
-        } else { None };
-        let ctext = pgp::pk_encrypt(raw_message, keyring, classic, pq, compress, seipd_version).await?;
-        Ok(ctext)
-    }
-
-    /// Symmetrically encrypt the message. This is used for broadcast channels.
-    /// `shared secret` is the secret that will be used for symmetric encryption.
-    pub async fn encrypt_symmetrically(
-        self,
-        context: &Context,
-        shared_secret: &str,
-        mail_to_encrypt: MimePart<'static>,
-        compress: bool,
-        sign: bool,
-    ) -> Result<String> {
-        // Broadcast: prefer classic so most subscribers can verify.
-        let sign_key = if sign {
-            Some(load_signing_secret_key(context, false).await?)
-        } else {
-            None
-        };
-
-        let shared_secret = shared_secret.to_string();
-        let mut raw_message = Vec::new();
-        let cursor = Cursor::new(&mut raw_message);
-        mail_to_encrypt.clone().write_part(cursor).ok();
-
-        let ctext = tokio::task::spawn_blocking(move || {
-            pgp::symm_encrypt_message(raw_message, sign_key, shared_secret, compress)
-        })
-        .await??;
-
-        Ok(ctext)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use anyhow::Result;
+
     use crate::chat;
     use crate::chat::send_text_msg;
     use crate::config::Config;
@@ -148,10 +45,9 @@ Sent with my Delta Chat Messenger: https://delta.chat";
 
         let mut msg = Message::new_text("Hello!".to_string());
         assert!(chat::send_msg(alice, chat.id, &mut msg).await.is_err());
-        assert_eq!(
-            msg.error().unwrap(),
-            "\u{26a0}\u{fe0f} Your email provider example.org requires end-to-end encryption which is not setup yet."
-        );
+        let expected_error = "\u{26a0}\u{fe0f} Your email provider example.org requires end-to-end encryption which is not setup yet.";
+        assert_eq!(msg.error().unwrap(), expected_error);
+        alice.assert_warn(expected_error).await;
         let info_msg = alice.get_last_msg().await;
         assert_eq!(
             info_msg.get_info_type(),

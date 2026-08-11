@@ -92,7 +92,7 @@ pub enum EventType {
         /// ID of the message for which reactions were changed.
         msg_id: MsgId,
 
-        /// ID of the contact whose reaction set is changed.
+        /// ID of the contact whose reaction set is changed. May be 0 eg. in case of broadcasted reactions.
         contact_id: ContactId,
     },
 
@@ -447,4 +447,22 @@ pub enum EventType {
         /// Number of events skipped.
         n: u64,
     },
+}
+
+impl EventType {
+    /// Returns the warning [`String`], if the event is a warning.
+    pub fn get_warn(&self) -> Option<&String> {
+        match self {
+            Self::Warning(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Returns the error [`String`], if the event is an error.
+    pub fn get_error(&self) -> Option<&String> {
+        match self {
+            Self::Error(s) | Self::ErrorSelfNotInGroup(s) => Some(s),
+            _ => None,
+        }
+    }
 }

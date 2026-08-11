@@ -21,7 +21,7 @@ fn emit_unknown_chatlist_items_changed(context: &Context) {
     context.emit_event(EventType::ChatlistItemChanged { chat_id: None });
 }
 
-/// update event for the 1:1 chat with the contact
+/// update event for the single chat with the contact
 /// used when recently seen changes and when profile image changes
 pub(crate) async fn emit_chatlist_item_changed_for_contact_chat(
     context: &Context,
@@ -58,11 +58,9 @@ pub(crate) fn emit_chatlist_items_changed_for_contact(context: &Context, _contac
 /// does not check for excess/too-many events
 #[cfg(test)]
 mod test_chatlist_events {
-
-    use std::{
-        sync::atomic::{AtomicBool, Ordering},
-        time::Duration,
-    };
+    use std::num::NonZero;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     use crate::{
         EventType,
@@ -500,8 +498,13 @@ mod test_chatlist_events {
         let mut tcm = TestContextManager::new();
         let alice = tcm.alice().await;
         let chat = create_group(&alice, "My Group").await?;
-        chat.set_ephemeral_timer(&alice, crate::ephemeral::Timer::Enabled { duration: 60 })
-            .await?;
+        chat.set_ephemeral_timer(
+            &alice,
+            crate::ephemeral::Timer::Enabled {
+                duration: NonZero::new(60).unwrap(),
+            },
+        )
+        .await?;
         alice
             .evtracker
             .get_matching(|evt| matches!(evt, EventType::ChatEphemeralTimerModified { .. }))

@@ -50,8 +50,6 @@ pub struct Aheader {
     /// header that is used to tell that the sender
     /// marked this key as verified.
     pub verified: bool,
-    /// Dedicated ML-DSA signing key gossip (`_pq_signing=1`).
-    pub pq_signing: bool,
 }
 
 impl fmt::Display for Aheader {
@@ -65,9 +63,6 @@ impl fmt::Display for Aheader {
         // if self.verified {
         //     write!(fmt, " _verified=1;")?;
         // }
-        if self.pq_signing {
-            write!(fmt, " _pq_signing=1;")?;
-        }
 
         // adds a whitespace every 78 characters, this allows
         // email crate to wrap the lines according to RFC 5322
@@ -120,7 +115,6 @@ impl Aheader {
             .unwrap_or_default();
 
         let verified = attributes.remove("_verified").is_some();
-        let pq_signing = attributes.remove("_pq_signing").is_some();
 
         // Autocrypt-Level0: unknown attributes starting with an underscore can be safely ignored
         // Autocrypt-Level0: unknown attribute, treat the header as invalid
@@ -133,7 +127,6 @@ impl Aheader {
             public_key,
             prefer_encrypt,
             verified,
-            pq_signing,
         })
     }
 }
@@ -250,8 +243,7 @@ mod tests {
                     addr: "test@example.com".to_string(),
                     public_key: SignedPublicKey::from_base64(RAWKEY).unwrap(),
                     prefer_encrypt: EncryptPreference::Mutual,
-                    verified: false,
-                    pq_signing: false,
+                    verified: false
                 }
             )
             .contains("prefer-encrypt=mutual;")
@@ -267,8 +259,7 @@ mod tests {
                     addr: "test@example.com".to_string(),
                     public_key: SignedPublicKey::from_base64(RAWKEY).unwrap(),
                     prefer_encrypt: EncryptPreference::NoPreference,
-                    verified: false,
-                    pq_signing: false,
+                    verified: false
                 }
             )
             .contains("prefer-encrypt")
@@ -282,8 +273,7 @@ mod tests {
                     addr: "TeSt@eXaMpLe.cOm".to_string(),
                     public_key: SignedPublicKey::from_base64(RAWKEY).unwrap(),
                     prefer_encrypt: EncryptPreference::Mutual,
-                    verified: false,
-                    pq_signing: false,
+                    verified: false
                 }
             )
             .contains("test@example.com")
@@ -297,8 +287,7 @@ mod tests {
                     addr: "test@example.com".to_string(),
                     public_key: SignedPublicKey::from_base64(RAWKEY).unwrap(),
                     prefer_encrypt: EncryptPreference::NoPreference,
-                    verified: true,
-                    pq_signing: false,
+                    verified: true
                 }
             )
             .contains("_verified")

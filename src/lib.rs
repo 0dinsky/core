@@ -17,7 +17,6 @@
     clippy::cloned_instead_of_copied,
     clippy::manual_is_variant_and
 )]
-#![cfg_attr(not(test), warn(clippy::large_futures))]
 #![cfg_attr(not(test), warn(clippy::arithmetic_side_effects))]
 #![cfg_attr(not(test), forbid(clippy::indexing_slicing))]
 #![cfg_attr(not(test), forbid(clippy::string_slice))]
@@ -55,6 +54,7 @@ pub(crate) mod events;
 pub use events::*;
 
 mod aheader;
+mod automatic_relay_management;
 pub mod blob;
 pub mod calls;
 pub mod chat;
@@ -81,6 +81,7 @@ mod param;
 mod pgp;
 #[cfg(feature = "internals")]
 pub mod pgp;
+pub mod pinned_messages;
 pub mod provider;
 pub mod qr;
 pub mod qr_code_generator;

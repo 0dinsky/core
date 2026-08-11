@@ -103,6 +103,8 @@ pub struct MessageObject {
 
     saved_message_id: Option<u32>,
 
+    is_pinned: bool,
+
     reactions: Option<JsonrpcReactions>,
 
     vcard_contact: Option<VcardContact>,
@@ -263,6 +265,7 @@ impl MessageObject {
                 .await?
                 .map(|id| id.to_u32()),
 
+            is_pinned: message.is_pinned(),
             reactions,
 
             vcard_contact: vcard_contacts.first().cloned(),
@@ -390,11 +393,11 @@ pub enum SystemMessageType {
     LocationOnly,
     InvalidUnencryptedMail,
 
-    /// 1:1 chats info message telling that SecureJoin has started and the user should wait for it
+    /// Single chats info message telling that SecureJoin has started and the user should wait for it
     /// to complete.
     SecurejoinWait,
 
-    /// 1:1 chats info message telling that SecureJoin is still running, but the user may already
+    /// Single chats info message telling that SecureJoin is still running, but the user may already
     /// send messages.
     SecurejoinWaitTimeout,
 
@@ -425,6 +428,8 @@ pub enum SystemMessageType {
 
     CallAccepted,
     CallEnded,
+    MessagePinned,
+    MessageUnpinned,
 }
 
 impl From<deltachat::mimeparser::SystemMessage> for SystemMessageType {
@@ -454,6 +459,8 @@ impl From<deltachat::mimeparser::SystemMessage> for SystemMessageType {
             SystemMessage::SecurejoinWaitTimeout => SystemMessageType::SecurejoinWaitTimeout,
             SystemMessage::CallAccepted => SystemMessageType::CallAccepted,
             SystemMessage::CallEnded => SystemMessageType::CallEnded,
+            SystemMessage::MessagePinned => SystemMessageType::MessagePinned,
+            SystemMessage::MessageUnpinned => SystemMessageType::MessageUnpinned,
         }
     }
 }
@@ -726,9 +733,9 @@ impl From<deltachat::ephemeral::Timer> for EphemeralTimer {
     fn from(value: deltachat::ephemeral::Timer) -> Self {
         match value {
             deltachat::ephemeral::Timer::Disabled => EphemeralTimer::Disabled,
-            deltachat::ephemeral::Timer::Enabled { duration } => {
-                EphemeralTimer::Enabled { duration }
-            }
+            deltachat::ephemeral::Timer::Enabled { duration } => EphemeralTimer::Enabled {
+                duration: duration.get(),
+            },
         }
     }
 }

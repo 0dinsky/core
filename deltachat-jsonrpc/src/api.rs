@@ -5,31 +5,31 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, str::FromStr};
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use deltachat::EventEmitter;
 pub use deltachat::accounts::Accounts;
 use deltachat::blob::BlobObject;
 use deltachat::calls::ice_servers;
 use deltachat::chat::{
-    self, add_contact_to_chat, forward_msgs, forward_msgs_2ctx, get_chat_media, get_chat_msgs,
-    get_chat_msgs_ex, markfresh_chat, marknoticed_all_chats, marknoticed_chat,
-    remove_contact_from_chat, Chat, ChatId, ChatItem, MessageListOptions,
+    self, Chat, ChatId, ChatItem, MessageListOptions, add_contact_to_chat, forward_msgs,
+    forward_msgs_2ctx, get_chat_media, get_chat_msgs, get_chat_msgs_ex, markfresh_chat,
+    marknoticed_all_chats, marknoticed_chat, remove_contact_from_chat,
 };
 use deltachat::chatlist::Chatlist;
-use deltachat::config::{get_all_ui_config_keys, Config};
+use deltachat::config::{Config, get_all_ui_config_keys};
 use deltachat::constants::DC_MSG_ID_DAYMARKER;
-use deltachat::contact::{may_be_valid_addr, Contact, ContactId, Origin};
+use deltachat::contact::{Contact, ContactId, Origin, may_be_valid_addr};
 use deltachat::context::get_info;
 use deltachat::ephemeral::Timer;
 use deltachat::imex;
 use deltachat::location;
 use deltachat::message::{
-    self, delete_msgs_ex, get_existing_msg_ids, get_msg_read_receipt_count, get_msg_read_receipts,
-    markseen_msgs, Message, MessageState, MsgId, Viewtype,
+    self, Message, MessageState, MsgId, Viewtype, delete_msgs_ex, get_existing_msg_ids,
+    get_msg_read_receipt_count, get_msg_read_receipts, markseen_msgs,
 };
 use deltachat::peer_channels::{
     leave_webxdc_realtime, send_webxdc_realtime_advertisement, send_webxdc_realtime_data,
 };
-use deltachat::provider::get_provider_info;
 use deltachat::qr::{self, Qr};
 use deltachat::qr_code_generator::{create_qr_svg, generate_backup_qr, get_securejoin_qr_svg};
 use deltachat::reaction::{get_msg_reactions, send_reaction};
@@ -37,10 +37,9 @@ use deltachat::securejoin;
 use deltachat::stock_str::StockMessage;
 use deltachat::storage_usage::{get_blobdir_storage_usage, get_storage_usage};
 use deltachat::webxdc::StatusUpdateSerial;
-use deltachat::EventEmitter;
 use sanitize_filename::is_sanitized;
 use tokio::fs;
-use tokio::sync::{watch, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, watch};
 use types::login_param::EnteredLoginParam;
 use yerpc::rpc;
 
@@ -54,8 +53,6 @@ use types::contact::{ContactObject, VcardContact};
 use types::events::Event;
 use types::http::HttpResponse;
 use types::message::{MessageData, MessageObject, MessageReadReceipt};
-use types::notify_state::JsonrpcNotifyState;
-use types::provider_info::ProviderInfo;
 use types::reactions::JsonrpcReactions;
 use types::webxdc::WebxdcMessageInfo;
 
@@ -67,7 +64,7 @@ use self::types::{
         JsonrpcMessageListItem, MessageNotificationInfo, MessageSearchResult, MessageViewtype,
     },
 };
-use crate::api::types::chat_list::{get_chat_list_item_by_id, ChatListItemFetchResult};
+use crate::api::types::chat_list::{ChatListItemFetchResult, get_chat_list_item_by_id};
 use crate::api::types::login_param::TransportListEntry;
 use crate::api::types::qr::{QrObject, SecurejoinSource, SecurejoinUiPath};
 
@@ -330,12 +327,6 @@ impl CommandApi {
         }
     }
 
-    /// Get the current push notification state.
-    async fn get_push_state(&self, account_id: u32) -> Result<JsonrpcNotifyState> {
-        let ctx = self.get_context(account_id).await?;
-        Ok(ctx.push_state().await.into())
-    }
-
     /// Get the combined filesize of an account in bytes
     async fn get_account_file_size(&self, account_id: u32) -> Result<u64> {
         let ctx = self.get_context(account_id).await?;
@@ -343,21 +334,6 @@ impl CommandApi {
         let total_size = get_blobdir_storage_usage(&ctx);
 
         Ok(dbfile + total_size)
-    }
-
-    /// Returns provider for the given domain.
-    ///
-    /// This function looks up domain in offline database.
-    ///
-    /// For compatibility, email address can be passed to this function
-    /// instead of the domain.
-    async fn get_provider_info(
-        &self,
-        _account_id: u32,
-        email: String,
-    ) -> Result<Option<ProviderInfo>> {
-        let provider_info = get_provider_info(email.split('@').next_back().unwrap_or(""));
-        Ok(ProviderInfo::from_dc_type(provider_info))
     }
 
     /// Checks if the context is already configured.
@@ -875,7 +851,7 @@ impl CommandApi {
     /// - The chat or the contact is **not blocked**, so new messages from the user/the group may appear as a contact request
     ///   and the user may create the chat again.
     /// - **Groups are not left** - this would
-    ///   be unexpected as (1) deleting a normal chat also does not prevent new mails
+    ///   be unexpected as (1) deleting a single chat also does not prevent new mails
     ///   from arriving, (2) leaving a group requires sending a message to
     ///   all group members - especially for groups not used for a longer time, this is
     ///   really unexpected when deletion results in contacting all members again,
@@ -1040,7 +1016,7 @@ impl CommandApi {
 
     /// Get the contact IDs belonging to a chat.
     ///
-    /// - for normal chats, the function always returns exactly one contact,
+    /// - for single chats, the function always returns exactly one contact,
     ///   DC_CONTACT_ID_SELF is returned only for SELF-chats.
     ///
     /// - for group chats all members are returned, DC_CONTACT_ID_SELF is returned
@@ -1381,7 +1357,7 @@ impl CommandApi {
     /// The concrete action depends on the type of the chat and on the users settings
     /// (dc_msgs_presented() may be a better name therefore, but well. :)
     ///
-    /// - For normal chats, the IMAP state is updated, MDN is sent
+    /// - For single chats, the IMAP state is updated, MDN is sent
     ///   (if set_config()-options `mdns_enabled` is set)
     ///   and the internal state is changed to @ref DC_STATE_IN_SEEN to reflect these actions.
     ///
@@ -1543,6 +1519,26 @@ impl CommandApi {
     ) -> Result<MessageNotificationInfo> {
         let ctx = self.get_context(account_id).await?;
         MessageNotificationInfo::from_msg_id(&ctx, MsgId::new(message_id)).await
+    }
+
+    /// Sets the "pinned" state for a message.
+    async fn set_pinned_message_state(
+        &self,
+        account_id: u32,
+        message_id: u32,
+        pinned_state: bool,
+    ) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        deltachat::pinned_messages::set_pinned_state(&ctx, MsgId::new(message_id), pinned_state)
+            .await
+    }
+
+    /// Returns all pinned messages of a chat.
+    async fn get_pinned_messages(&self, account_id: u32, chat_id: u32) -> Result<Vec<u32>> {
+        let ctx = self.get_context(account_id).await?;
+        let msg_ids =
+            deltachat::pinned_messages::get_pinned_messages(&ctx, ChatId::new(chat_id)).await?;
+        Ok(msg_ids.into_iter().map(|id| id.to_u32()).collect())
     }
 
     /// Delete messages. The messages are deleted on the current device and
@@ -1923,7 +1919,7 @@ impl CommandApi {
     //                   chat
     // ---------------------------------------------
 
-    /// Returns the [`ChatId`] for the 1:1 chat with `contact_id` if it exists.
+    /// Returns the [`ChatId`] for the single chat with `contact_id` if it exists.
     ///
     /// If it does not exist, `None` is returned.
     async fn get_chat_id_by_contact_id(
@@ -2108,13 +2104,10 @@ impl CommandApi {
 
     /// Get the current connectivity, i.e. whether the device is connected to the IMAP server.
     /// One of:
-    /// - DC_CONNECTIVITY_NOT_CONNECTED (1000-1999): Show e.g. the string "Not connected" or a red dot
-    /// - DC_CONNECTIVITY_CONNECTING (2000-2999): Show e.g. the string "Connecting…" or a yellow dot
-    /// - DC_CONNECTIVITY_WORKING (3000-3999): Show e.g. the string "Getting new messages" or a spinning wheel
-    /// - DC_CONNECTIVITY_CONNECTED (>=4000): Show e.g. the string "Connected" or a green dot
-    ///
-    /// We don't use exact values but ranges here so that we can split up
-    /// states into multiple states in the future.
+    /// - DC_CONNECTIVITY_NOT_CONNECTED (1000): Show e.g. the string "Not connected" or a red dot
+    /// - DC_CONNECTIVITY_CONNECTING (2000): Show e.g. the string "Connecting…" or a yellow dot
+    /// - DC_CONNECTIVITY_WORKING (3000): Show e.g. the string "Getting new messages" or a spinning wheel
+    /// - DC_CONNECTIVITY_CONNECTED (4000): Show e.g. the string "Connected" or a green dot
     ///
     /// Meant as a rough overview that can be shown
     /// e.g. in the title of the main screen.
@@ -2308,7 +2301,7 @@ impl CommandApi {
         let message = Message::load_from_db(&ctx, MsgId::new(instance_msg_id)).await?;
         let blob = message.get_webxdc_blob(&ctx, &path).await?;
 
-        use base64::{engine::general_purpose, Engine as _};
+        use base64::{Engine as _, engine::general_purpose};
         Ok(general_purpose::STANDARD_NO_PAD.encode(blob))
     }
 

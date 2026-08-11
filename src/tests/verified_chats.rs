@@ -22,16 +22,16 @@ use crate::test_utils::{
 use crate::tools::SystemTime;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_verified_oneonone_chat_not_broken_by_classical() {
-    check_verified_oneonone_chat_protection_not_broken(true).await;
+async fn test_verified_single_chat_not_broken_by_classical() {
+    check_verified_single_chat_protection_not_broken(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_verified_oneonone_chat_not_broken_by_device_change() {
-    check_verified_oneonone_chat_protection_not_broken(false).await;
+async fn test_verified_single_chat_not_broken_by_device_change() {
+    check_verified_single_chat_protection_not_broken(false).await;
 }
 
-async fn check_verified_oneonone_chat_protection_not_broken(by_classical_email: bool) {
+async fn check_verified_single_chat_protection_not_broken(by_classical_email: bool) {
     let mut tcm = TestContextManager::new();
     let alice = tcm.alice().await;
     let bob = tcm.bob().await;
@@ -57,6 +57,7 @@ async fn check_verified_oneonone_chat_protection_not_broken(by_classical_email: 
         .await
         .unwrap()
         .unwrap();
+        alice.assert_warn("unencrypted message").await;
         let contact = alice.add_or_lookup_contact(&bob).await;
         assert_eq!(contact.is_verified(&alice).await.unwrap(), true);
         assert_verified(&alice, &bob).await;
@@ -83,7 +84,7 @@ async fn check_verified_oneonone_chat_protection_not_broken(by_classical_email: 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_create_verified_oneonone_chat() -> Result<()> {
+async fn test_create_verified_single_chat() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = tcm.alice().await;
     let bob = tcm.bob().await;
@@ -168,11 +169,11 @@ async fn test_missing_key_reexecute_securejoin() -> Result<()> {
 }
 
 /// Tests that receiving unencrypted message
-/// does not disable protection of 1:1 chat.
+/// does not disable protection of single chat.
 ///
 /// Instead, an email-chat is created.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_degrade_verified_oneonone_chat() -> Result<()> {
+async fn test_degrade_verified_single_chat() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
@@ -598,6 +599,13 @@ async fn test_verified_lost_member_added() -> Result<()> {
     let result = send_msg(bob, bob_chat_id, &mut msg).await;
     assert!(result.is_err());
 
+    bob.assert_warn("Missing key for fiona@example.net").await;
+    fiona.assert_warn("missing key").await;
+    fiona.assert_warn("unencrypted message").await;
+    bob.assert_warn("Missing key for fiona@example.net").await;
+    bob.assert_warn(r#"No recipient keys are available, cannot encrypt to ["fiona@example.net"]"#)
+        .await;
+
     Ok(())
 }
 
@@ -755,7 +763,7 @@ async fn test_no_reverification() -> Result<()> {
 /// so we should mark the contact as verified,
 /// but with unknown verifier.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_no_direct_verification_via_bcc() -> Result<()> {
+async fn test_no_single_verification_via_bcc() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
     let alice2 = &tcm.alice().await;

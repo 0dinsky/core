@@ -17,10 +17,9 @@ use crate::context::Context;
 use crate::events::EventType;
 use crate::log::LogExt;
 use crate::mimefactory::RECOMMENDED_FILE_SIZE;
-use crate::provider::Provider;
 use crate::sync::{self, Sync::*, SyncData};
 use crate::tools::{get_abs_path, time};
-use crate::transport::{ConfiguredLoginParam, add_pseudo_transport, send_sync_transports};
+use crate::transport::{add_pseudo_transport, send_sync_transports};
 use crate::{constants, stats};
 
 /// The available configuration keys.
@@ -193,7 +192,9 @@ pub enum Config {
     #[strum(props(default = "0"))]
     DeleteDeviceAfter,
 
-    /// The primary email address.
+    /// The primary email address, used for sending and background fetch.
+    ///
+    /// Device-local, other devices keep their own primary transport.
     ConfiguredAddr,
 
     /// Deprecated(2026-04).
@@ -295,9 +296,6 @@ pub enum Config {
     /// Unix timestamp of the last successful configuration.
     ConfiguredTimestamp,
 
-    /// ID of the configured provider from the provider database.
-    ConfiguredProvider,
-
     /// Deprecated(2026-04).
     /// Use [`Context::is_configured()`] instead.
     ///
@@ -350,8 +348,20 @@ pub enum Config {
     /// Timestamp of the last time housekeeping was run
     LastHousekeeping,
 
+    /// Timestamp of the last time accumulated broadcast channel reactions were sent
+    LastReactionsBroadcast,
+
     /// Timestamp of the last `CantDecryptOutgoingMsgs` notification.
     LastCantDecryptOutgoingMsgs,
+
+    /// Timestamp of the last time automatic relay management was run
+    LastAutomaticRelayManagement,
+
+    /// Whether to automatically add/remove transports
+    AutomaticRelayManagement,
+
+    /// Whether automatic relay management successfully added the desired number of relays
+    AutomaticRelayManagementFinished,
 
     /// Whether to avoid using IMAP IDLE even if the server supports it.
     ///
@@ -469,82 +479,15 @@ pub enum Config {
     ///
     /// - `0` (default) — **Classic**: Ed25519Legacy + Curve25519 ECDH (OpenPGP v4).
     ///   Maximum compatibility with all OpenPGP clients.
-    /// - `1` — **Post-quantum hybrid** (OpenPGP v6): Ed25519 primary key +
-    ///   ML-KEM-768+X25519 encryption subkey (draft-ietf-openpgp-pqc).
-    ///   Backward-compatible: classic clients fall back to the X25519 KEM component.
+    /// - `1` — **Post-quantum hybrid**: Ed25519 primary key +
+    ///   classic X25519 encryption subkey + ML-KEM-768+X25519 encryption subkey
+    ///   (draft-ietf-openpgp-pqc).
+    ///   Backward-compatible: classic clients fall back to the X25519 subkey.
     ///
     /// **Changing this setting only affects the next key generation.**
     /// Existing keys are not replaced automatically.
-    ///
-    /// # Perfect Forward Secrecy
-    ///
-    /// TLS-layer PFS is already guaranteed: Delta Chat uses TLS 1.3 (ephemeral
-    /// key exchange by design) and TLS 1.2 session resumption is disabled.
-    ///
-    /// OpenPGP-layer PFS is achieved by rotating the whole keypair periodically
-    /// via `KeyRotationPeriod`, and permanently erasing each rotated-out key's
-    /// secret material a few days later. After that erasure, compromising the
-    /// current key does not expose messages encrypted to the old, deleted key
-    /// — because that key simply no longer exists anywhere.
     #[strum(props(default = "0"))]
     KeyGenMode,
-
-    /// Keypair rotation period in days (0 = disabled).
-    ///
-    /// When non-zero, a fresh keypair is generated and made active every N
-    /// days. The rotated-out key's secret material is kept for a few more
-    /// days (to decrypt messages still in flight), then permanently erased.
-    ///
-    /// This provides **partial forward secrecy** at the OpenPGP layer:
-    /// compromise of the current key does not expose messages encrypted to
-    /// older, already-erased keys.
-    ///
-    /// Caveat: this rotates the *whole* keypair (signing + encryption), not
-    /// just the encryption subkey, so the fingerprint changes on every
-    /// rotation — contacts keep Verified status when only the encryption subkey rotates
-    /// (fingerprint stays the same); full primary change still requires re-verify. Peers still pick up the new key automatically
-    /// via the Autocrypt header on the next message either way.
-    ///
-    /// Recommended values: 30–90 days.  Set to `0` to disable rotation (default).
-    #[strum(props(default = "0"))]
-    KeyRotationPeriod,
-
-    /// Grace period, in days, before the secret material of a rotated-out
-    /// encryption subkey is permanently forgotten (see
-    /// [`crate::key::maybe_rotate_keypair`] /
-    /// `crate::pgp::forget_expired_encryption_subkeys`).
-    ///
-    /// This window must be long enough for messages already in flight and
-    /// for second devices that have not yet re-synced after a rotation to
-    /// still be able to decrypt — a short grace looks safer on paper but
-    /// breaks multi-device in practice. For that reason, values are always
-    /// clamped to **7–90 days** (hard floor of 7) regardless of what is
-    /// requested, both by `Context::set_config_ex` and by anyone reading
-    /// the raw config directly.
-    ///
-    /// Unset or `<= 0` falls back to the default of 30 days.
-    #[strum(props(default = "30"))]
-    KeyRotationGraceDays,
-}
-
-/// Default for [`Config::KeyRotationGraceDays`] when unset.
-pub(crate) const DEFAULT_KEY_ROTATION_GRACE_DAYS: i64 = 30;
-/// Hard floor for [`Config::KeyRotationGraceDays`]: below this, in-flight
-/// messages and lagging second devices risk losing the ability to decrypt.
-pub(crate) const MIN_KEY_ROTATION_GRACE_DAYS: i64 = 7;
-/// Hard ceiling for [`Config::KeyRotationGraceDays`].
-pub(crate) const MAX_KEY_ROTATION_GRACE_DAYS: i64 = 90;
-
-/// Clamps a requested [`Config::KeyRotationGraceDays`] value to the allowed
-/// **7–90 day** range, falling back to the 30-day default for missing or
-/// non-positive input.
-pub(crate) fn clamp_key_rotation_grace_days(days: i64) -> i64 {
-    let days = if days > 0 {
-        days
-    } else {
-        DEFAULT_KEY_ROTATION_GRACE_DAYS
-    };
-    days.clamp(MIN_KEY_ROTATION_GRACE_DAYS, MAX_KEY_ROTATION_GRACE_DAYS)
 }
 
 impl Config {
@@ -697,16 +640,6 @@ impl Context {
         self.get_config_bool(Config::MdnsEnabled).await
     }
 
-    /// Gets the configured provider.
-    ///
-    /// The provider is determined by the current primary transport.
-    pub async fn get_configured_provider(&self) -> Result<Option<&'static Provider>> {
-        let provider = ConfiguredLoginParam::load(self)
-            .await?
-            .and_then(|(_transport_id, param)| param.provider);
-        Ok(provider)
-    }
-
     /// Gets configured "delete_device_after" value.
     ///
     /// `None` means never delete the message, `Some(x)` means delete
@@ -835,17 +768,6 @@ impl Context {
                 }
                 self.sql.set_raw_config(key.as_ref(), value).await?;
             }
-            Config::KeyRotationGraceDays => {
-                // Hard floor/ceiling enforced here so that no caller — UI,
-                // JSON-RPC, or config sync from another device — can push
-                // this below the multi-device-safe minimum.
-                if let Some(v) = value {
-                    let requested: i64 = v.trim().parse().unwrap_or_default();
-                    better_value = clamp_key_rotation_grace_days(requested).to_string();
-                    value = Some(&better_value);
-                }
-                self.sql.set_raw_config(key.as_ref(), value).await?;
-            }
             Config::Addr => {
                 self.sql
                     .set_raw_config(key.as_ref(), value.map(|s| s.to_lowercase()).as_deref())
@@ -884,35 +806,38 @@ impl Context {
                                 (addr,),
                             )?;
 
-                            // Update the timestamp for the primary transport
-                            // so it becomes the first in `get_all_self_addrs()` list
-                            // and the list of relays distributed in the public key.
-                            // This ensures that messages will be sent
-                            // to the primary relay by the contacts
-                            // and will be fetched in background_fetch()
-                            // which only fetches from the primary transport.
+                            // `is_published=1`: an unpublished primary would be missing
+                            // from the relay list in the public key, so contacts would
+                            // never send to it.
+                            //
+                            // The timestamp must strictly increase because
+                            // other devices ignore the row update otherwise,
+                            // and contacts only adopt the re-signed key
+                            // if its signature timestamp increases.
                             transaction
                                 .execute(
-                                    "UPDATE transports SET add_timestamp=?, is_published=1 WHERE addr=?",
+                                    "UPDATE transports
+                                     SET add_timestamp=MAX(?, add_timestamp+1), is_published=1
+                                     WHERE addr=?",
                                     (time(), addr),
                                 )
                                 .context(
                                     "Failed to update add_timestamp for the new primary transport",
                                 )?;
 
-                            // Clean up SMTP and IMAP APPEND queue.
+                            // Clean up SMTP queue.
                             //
                             // The messages in the queue have a different
                             // From address so we cannot send them over
                             // the new SMTP transport.
                             transaction.execute("DELETE FROM smtp", ())?;
-                            transaction.execute("DELETE FROM imap_send", ())?;
 
                             Ok(())
                         })
                         .await?;
-                    send_sync_transports(self).await?;
+                    // Invalidate the cache so the sync message cannot read a stale primary address.
                     self.sql.uncache_raw_config("configured_addr").await;
+                    send_sync_transports(self).await?;
                 }
             }
             _ => {

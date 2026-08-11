@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 use std::io::Cursor;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail, ensure};
 use base64::Engine as _;
@@ -312,19 +311,6 @@ pub(crate) async fn load_self_public_key_opt(context: &Context) -> Result<Option
     Ok(Some(signed_public_key))
 }
 
-/// Returns which algorithm family (classic or post-quantum) our own current
-/// encryption subkey uses, for display in settings/account UI (e.g. "Your
-/// key: Post-quantum").
-///
-/// Returns `None` if we don't have a key yet (it hasn't been generated,
-/// e.g. because no message was sent or received yet).
-pub async fn self_encryption_kind(context: &Context) -> Result<Option<crate::pgp::EncryptionKind>> {
-    let Some(public_key) = load_self_public_key_opt(context).await? else {
-        return Ok(None);
-    };
-    Ok(crate::pgp::encryption_kind(&public_key))
-}
-
 /// Loads own public key.
 ///
 /// If no key is generated yet, generates a new one.
@@ -369,15 +355,12 @@ pub(crate) async fn load_self_public_keyring(context: &Context) -> Result<Vec<Si
 /// If no key is generated yet, generates a new one.
 ///
 /// For performance reasons, the fingerprint is cached after the first invocation.
-/// The cache is invalidated by [`rotate_self_keypair`] when the active key changes.
-pub(crate) async fn self_fingerprint(context: &Context) -> Result<String> {
-    let mut lock = context.self_fingerprint.lock().await;
-    if let Some(ref fp) = *lock {
-        Ok(fp.clone())
+pub(crate) async fn self_fingerprint(context: &Context) -> Result<&str> {
+    if let Some(fp) = context.self_fingerprint.get() {
+        Ok(fp)
     } else {
         let fp = load_self_public_key(context).await?.dc_fingerprint().hex();
-        *lock = Some(fp.clone());
-        Ok(fp)
+        Ok(context.self_fingerprint.get_or_init(|| fp))
     }
 }
 
@@ -387,15 +370,12 @@ pub(crate) async fn self_fingerprint(context: &Context) -> Result<String> {
 /// Returns `None` if no key is generated yet.
 ///
 /// For performance reasons, the fingerprint is cached after the first invocation.
-/// The cache is invalidated by [`rotate_self_keypair`] when the active key changes.
-pub(crate) async fn self_fingerprint_opt(context: &Context) -> Result<Option<String>> {
-    let mut lock = context.self_fingerprint.lock().await;
-    if let Some(ref fp) = *lock {
-        Ok(Some(fp.clone()))
+pub(crate) async fn self_fingerprint_opt(context: &Context) -> Result<Option<&str>> {
+    if let Some(fp) = context.self_fingerprint.get() {
+        Ok(Some(fp))
     } else if let Some(key) = load_self_public_key_opt(context).await? {
         let fp = key.dc_fingerprint().hex();
-        *lock = Some(fp.clone());
-        Ok(Some(fp))
+        Ok(Some(context.self_fingerprint.get_or_init(|| fp)))
     } else {
         Ok(None)
     }
@@ -443,47 +423,6 @@ pub(crate) async fn load_self_secret_keyring(context: &Context) -> Result<Vec<Si
         .collect();
     Ok(keys)
 }
-
-/// Select a signing key: PQ when `prefer_pq`, otherwise classic.
-/// Falls back to active key if the preferred family is missing.
-pub(crate) async fn load_signing_secret_key(
-    context: &Context,
-    prefer_pq: bool,
-) -> Result<SignedSecretKey> {
-    let keys = load_self_secret_keyring(context).await?;
-    if keys.is_empty() {
-        return load_self_secret_key(context).await;
-    }
-    let mut classic = None;
-    let mut pq = None;
-    for key in &keys {
-        if crate::pgp::is_pq_signing_secret(key) {
-            if pq.is_none() {
-                pq = Some(key.clone());
-            }
-        } else if classic.is_none() {
-            classic = Some(key.clone());
-        }
-    }
-    if prefer_pq {
-        if let Some(k) = pq {
-            return Ok(k);
-        }
-        if let Some(k) = classic {
-            return Ok(k);
-        }
-    } else if let Some(k) = classic {
-        return Ok(k);
-    } else if let Some(k) = pq {
-        info!(
-            context,
-            "No classic signing key; signing with PQ key (classic peers will not verify)."
-        );
-        return Ok(k);
-    }
-    load_self_secret_key(context).await
-}
-
 
 impl DcKey for SignedPublicKey {
     fn to_asc(&self, header: Option<(&str, &str)>) -> String {
@@ -541,26 +480,24 @@ async fn generate_keypair(context: &Context) -> Result<SignedSecretKey> {
         Some(key_pair) => Ok(key_pair),
         None => {
             let start = tools::Time::now();
-
-            // 0=classic; 1=classic primary+ML-KEM Autocrypt + dedicated V6 ML-DSA signing key
+            info!(context, "Generating keypair.");
             let key_gen_mode = context.get_config_int(Config::KeyGenMode).await?;
-            if key_gen_mode == 1 {
-                info!(context, "Generating hybrid Autocrypt key + dedicated PQ signing key.");
-            } else {
-                info!(context, "Generating classic keypair (Ed25519 + Curve25519).");
-            }
-            let addr_for_signing = addr.clone();
             let keypair = Handle::current()
                 .spawn_blocking(move || {
-                    if key_gen_mode == 1 { crate::pgp::create_pqc_keypair(addr) }
-                    else { crate::pgp::create_keypair(addr) }
+                    if key_gen_mode == 1 {
+                        crate::pgp::create_pqc_keypair(addr)
+                    } else {
+                        crate::pgp::create_keypair(addr)
+                    }
                 })
                 .await??;
+
             store_self_keypair(context, &keypair).await?;
-            if key_gen_mode == 1 {
-                ensure_pq_signing_key(context, addr_for_signing).await?;
-            }
-            info!(context, "Keypair generated in {:.3}s.", time_elapsed(&start).as_secs());
+            info!(
+                context,
+                "Keypair generated in {:.3}s.",
+                time_elapsed(&start).as_secs(),
+            );
             Ok(keypair)
         }
     }
@@ -618,9 +555,9 @@ pub(crate) async fn store_self_keypair(
             // so this fails if we already have this key.
             transaction
                 .execute(
-                    "INSERT INTO keypairs (public_key, private_key, created)
-                     VALUES (?,?,?)",
-                    (&public_key, &secret_key, tools::time()),
+                    "INSERT INTO keypairs (public_key, private_key)
+                     VALUES (?,?)",
+                    (&public_key, &secret_key),
                 )
                 .context("Failed to insert keypair")?;
 
@@ -642,65 +579,6 @@ pub(crate) async fn store_self_keypair(
     Ok(())
 }
 
-
-async fn store_additional_keypair(context: &Context, signed_secret_key: &SignedSecretKey) -> Result<i64> {
-    let signed_public_key = signed_secret_key.to_public_key();
-    context.sql.transaction(|transaction| {
-        let public_key = DcKey::to_bytes(&signed_public_key);
-        let secret_key = DcKey::to_bytes(signed_secret_key);
-        transaction.execute(
-            "INSERT INTO keypairs (public_key, private_key, created) VALUES (?,?,?)",
-            (&public_key, &secret_key, tools::time()),
-        ).context("Failed to insert additional keypair")?;
-        Ok(transaction.last_insert_rowid())
-    }).await
-}
-
-pub(crate) async fn ensure_pq_signing_key(context: &Context, addr: EmailAddress) -> Result<()> {
-    let keys = load_self_secret_keyring(context).await?;
-    if keys.iter().any(crate::pgp::is_pq_signing_secret) {
-        if context.sql.get_raw_config_int64("pq_signing_key_id").await?.is_none() {
-            for key in &keys {
-                if crate::pgp::is_pq_signing_secret(key) {
-                    let bytes = DcKey::to_bytes(key);
-                    if let Some(id) = context.sql.query_get_value::<i64>(
-                        "SELECT id FROM keypairs WHERE private_key=?", (bytes,),
-                    ).await? {
-                        context.sql.set_raw_config("pq_signing_key_id", Some(&id.to_string())).await?;
-                    }
-                    break;
-                }
-            }
-        }
-        return Ok(());
-    }
-    info!(context, "Generating dedicated PQ signing key (ML-DSA-65+Ed25519, V6).");
-    let pq_key = Handle::current()
-        .spawn_blocking(move || crate::pgp::create_pq_signing_keypair(addr))
-        .await??;
-    let key_id = store_additional_keypair(context, &pq_key).await?;
-    context.sql.set_raw_config("pq_signing_key_id", Some(&key_id.to_string())).await?;
-    let _ = crate::contact::import_public_key(context, &pq_key.to_public_key()).await;
-    info!(context, "PQ signing key stored (id={key_id}).");
-    Ok(())
-}
-
-pub(crate) async fn maybe_ensure_pq_signing_key(context: &Context) -> Result<()> {
-    if context.get_config_int(Config::KeyGenMode).await? != 1 { return Ok(()); }
-    let addr = context.get_primary_self_addr().await?;
-    let Ok(addr) = EmailAddress::new(&addr) else { return Ok(()); };
-    ensure_pq_signing_key(context, addr).await
-}
-
-pub(crate) async fn load_pq_signing_public_key(context: &Context) -> Result<Option<SignedPublicKey>> {
-    for key in load_self_secret_keyring(context).await? {
-        if crate::pgp::is_pq_signing_secret(&key) {
-            return Ok(Some(key.to_public_key()));
-        }
-    }
-    Ok(None)
-}
-
 /// Saves a keypair as the default keys.
 ///
 /// This API is used for testing purposes
@@ -709,295 +587,6 @@ pub(crate) async fn load_pq_signing_public_key(context: &Context) -> Result<Opti
 pub async fn preconfigure_keypair(context: &Context, secret_data: &str) -> Result<()> {
     let secret = SignedSecretKey::from_asc(secret_data)?;
     store_self_keypair(context, &secret).await?;
-    Ok(())
-}
-
-/// How long, in days, to keep *full keypair rows* that are no longer the
-/// active key, before deleting them from the `keypairs` table.
-///
-/// These rows are redundant once the current key already embeds the old
-/// encryption subkeys (see `rotate_encryption_subkey`). Deleting them is
-/// relatively safe: decryption still walks the full keyring and the current
-/// key continues to hold the recent subkey secrets until the longer
-/// [`KEY_FORGET_SUBKEY_GRACE_DAYS`] window elapses.
-const KEY_ROTATION_ROW_GRACE_DAYS: i64 = 14;
-
-/// How long, in days, to keep the **secret material** of old encryption
-/// subkeys that are still embedded inside the *current* key, before
-/// permanently forgetting them via
-/// [`crate::pgp::forget_expired_encryption_subkeys`].
-///
-/// This window must be long enough for:
-/// - messages already in flight (slow relays, offline recipients);
-/// - second devices that have not yet been re-synced / re-exported after a
-///   rotation (Autocrypt Setup Message / QR only transfers the *current*
-///   key — if recent subkeys were already forgotten, those devices lose
-///   the ability to decrypt mail encrypted to them).
-///
-/// OpenPGP has no native PFS. A short grace looks good on paper and breaks
-/// multi-device in practice. Prefer weeks, not days. The forget step also
-/// always retains at least the newest two encryption subkeys regardless of
-/// age (see `MIN_RETAINED_ENCRYPTION_SUBKEYS` in `pgp.rs`).
-///
-/// Configurable via [`Config::KeyRotationGraceDays`] (default 30 days,
-/// clamped to 7–90 — see [`crate::config::clamp_key_rotation_grace_days`]).
-/// [`key_forget_subkey_grace_days`] reads the live, clamped value; this
-/// constant only documents the default and is used in the doc comments
-/// below.
-#[allow(dead_code)]
-const KEY_FORGET_SUBKEY_GRACE_DAYS: i64 = crate::config::DEFAULT_KEY_ROTATION_GRACE_DAYS;
-
-/// Reads [`Config::KeyRotationGraceDays`] and returns it clamped to the
-/// multi-device-safe 7–90 day range, falling back to 30 days if unset.
-async fn key_forget_subkey_grace_days(context: &Context) -> Result<i64> {
-    let raw = i64::from(context.get_config_int(Config::KeyRotationGraceDays).await?);
-    Ok(crate::config::clamp_key_rotation_grace_days(raw))
-}
-
-/// If `Config::KeyRotationPeriod` is set and our current key is older than
-/// that many days, rotates the encryption subkey (adding or dropping the PQ
-/// hybrid subkey to match `Config::KeyGenMode`) and makes the result the
-/// active key.
-///
-/// Also:
-/// 1. Deletes *old keypair rows* past [`KEY_ROTATION_ROW_GRACE_DAYS`].
-/// 2. Forgets encryption-subkey secrets embedded in the *current* key past
-///    [`KEY_FORGET_SUBKEY_GRACE_DAYS`], while always keeping the newest few
-///    (multi-device safety floor).
-///
-/// `rotate_encryption_subkey` folds every previous encryption subkey into
-/// each new key it produces so in-flight messages and lagging second
-/// devices keep decrypting across a rotation. Those old subkeys would
-/// otherwise survive inside the current key forever unless pruned here.
-/// Without the forget step, deleting old `keypairs` rows only removes
-/// redundant snapshots — the current key would still decrypt with
-/// arbitrarily old subkey material.
-///
-/// This only ever rotates the encryption subkey — the primary fingerprint
-/// (and therefore Verified status at contacts) stays stable, including
-/// across a classic↔PQ `KeyGenMode` toggle. See
-/// [`crate::pgp::create_pqc_keypair`]'s docs for why PQ mode no longer needs
-/// a different primary.
-///
-/// ## Multi-device
-///
-/// Private keys are transferred to a second device via Autocrypt Setup
-/// Message / QR ("Add as second device"). Only the **current** key is
-/// exported. As long as that key still contains recent encryption subkeys,
-/// the second device can decrypt recent history. Aggressive forget would
-/// leave second devices unable to decrypt — do not shorten
-/// [`KEY_FORGET_SUBKEY_GRACE_DAYS`] without a coordinated multi-device key
-/// sync protocol. After a rotation, re-exporting to secondary devices
-/// before the forget window closes keeps them able to read new mail.
-pub(crate) async fn maybe_rotate_keypair(context: &Context) -> Result<()> {
-    let now = tools::time();
-
-    let period_days = context.get_config_int(Config::KeyRotationPeriod).await?;
-    if period_days > 0 {
-        let current_key_created: Option<i64> = context
-            .sql
-            .query_row_optional(
-                "SELECT created FROM keypairs
-                 WHERE id=(SELECT value FROM config WHERE keyname='key_id')",
-                (),
-                |row| row.get(0),
-            )
-            .await?;
-
-        // A `created` of 0 means this key predates the column being
-        // populated; treat that the same as "just generated" rather than
-        // "infinitely old" so we don't force an immediate rotation on
-        // every existing account the first time this code runs.
-        let age_days = match current_key_created {
-            Some(created) if created > 0 => (now - created) / 86_400,
-            _ => 0,
-        };
-
-        if age_days >= i64::from(period_days) {
-            let key_gen_mode = context.get_config_int(Config::KeyGenMode).await?;
-            info!(
-                context,
-                "Rotating encryption subkey (age {age_days} days >= period {period_days} days, mode={key_gen_mode})."
-            );
-            let addr = context.get_primary_self_addr().await?;
-            let addr = EmailAddress::new(&addr)?;
-            // Toggling PQ mode only ever changes which encryption subkeys
-            // are present now (see `create_pqc_keypair`'s docs) — it never
-            // needs a new primary, so this is always a subkey-only
-            // rotation. The primary fingerprint (and Verified status for
-            // our contacts) stays stable either way.
-            let current = load_self_secret_key(context).await?;
-            let want_pq = key_gen_mode == 1;
-            let new_key = Handle::current()
-                .spawn_blocking(move || {
-                    crate::pgp::rotate_encryption_subkey(&current, addr, want_pq)
-                })
-                .await??;
-            rotate_self_keypair(context, &new_key).await?;
-        }
-    }
-
-    // 1) Delete old *keypair rows* that are past the shorter row-grace.
-    //    These are full snapshots that became redundant once the current
-    //    key already embeds the previous encryption subkeys. Decryption
-    //    still uses the full keyring + the current key's embedded secrets.
-    let row_cutoff = now - KEY_ROTATION_ROW_GRACE_DAYS * 86_400;
-    let deleted = context
-        .sql
-        .execute(
-            "DELETE FROM keypairs
-             WHERE id != (SELECT value FROM config WHERE keyname='key_id')
-               AND id != IFNULL((SELECT value FROM config WHERE keyname='pq_signing_key_id'), -1)
-               AND created > 0
-               AND created < ?",
-            (row_cutoff,),
-        )
-        .await?;
-    if deleted > 0 {
-        info!(
-            context,
-            "Erased {deleted} rotated-out keypair row(s) past their {KEY_ROTATION_ROW_GRACE_DAYS}-day grace."
-        );
-    }
-
-    // 2) Forget encryption-subkey *secrets* embedded in the current key,
-    //    but only after the longer multi-device-safe window. The helper
-    //    always keeps at least the newest two subkeys regardless of age.
-    let forget_grace_days = key_forget_subkey_grace_days(context).await?;
-    let forget_cutoff_secs = now - forget_grace_days * 86_400;
-    let forget_cutoff = UNIX_EPOCH + Duration::from_secs(forget_cutoff_secs.max(0) as u64);
-    let current = load_self_secret_key(context).await?;
-    let subkeys_before = current.secret_subkeys.len();
-    let pruned = Handle::current()
-        .spawn_blocking(move || {
-            crate::pgp::forget_expired_encryption_subkeys(&current, forget_cutoff)
-        })
-        .await?;
-    // Err = nothing safe to prune yet (under retention floor, still within
-    // grace, or no prior rotation) — not a hard failure.
-    if let Ok(pruned_key) = pruned {
-        let forgotten = subkeys_before.saturating_sub(pruned_key.secret_subkeys.len());
-        if forgotten > 0 {
-            save_current_keypair(context, &pruned_key).await?;
-            info!(
-                context,
-                "Forgot {forgotten} expired encryption subkey(s) past their {forget_grace_days}-day multi-device-safe grace."
-            );
-        }
-    }
-    maybe_ensure_pq_signing_key(context).await?;
-    Ok(())
-}
-
-/// Immediately generates a fresh keypair — honoring the current
-/// `Config::KeyGenMode` — and makes it the active self key, without waiting
-/// for `Config::KeyRotationPeriod` to elapse.
-///
-/// This is meant to be called right after the user changes `KeyGenMode`
-/// (e.g. turns on post-quantum key generation) if they want the change to
-/// take effect for their existing account immediately, rather than only for
-/// the next account they set up or the next scheduled rotation.
-///
-/// This always rotates only the encryption subkey — see
-/// [`crate::pgp::create_pqc_keypair`]'s docs for why PQ mode no longer needs
-/// a new primary. The primary fingerprint (and Verified status at contacts)
-/// stays stable, including when toggling classic↔PQ; no re-verification is
-/// ever required for this.
-///
-/// Old encryption-subkey secrets remain inside the current key for
-/// [`KEY_FORGET_SUBKEY_GRACE_DAYS`] (and at least the newest two are always
-/// retained) so that in-flight mail and second devices that have not yet
-/// been re-exported can still decrypt. Full old keypair rows are dropped
-/// after the shorter [`KEY_ROTATION_ROW_GRACE_DAYS`]. After a rotation,
-/// re-exporting to secondary devices before the forget window closes keeps
-/// multi-device setups able to read new mail.
-pub async fn rotate_keypair_now(context: &Context) -> Result<()> {
-    let key_gen_mode = context.get_config_int(Config::KeyGenMode).await?;
-    let addr = context.get_primary_self_addr().await?;
-    let addr = EmailAddress::new(&addr)?;
-    info!(
-        context,
-        "Rotating encryption subkey on demand (key_gen_mode={key_gen_mode})."
-    );
-    let current = load_self_secret_key(context).await?;
-    let want_pq = key_gen_mode == 1;
-    let new_key = Handle::current()
-        .spawn_blocking(move || crate::pgp::rotate_encryption_subkey(&current, addr, want_pq))
-        .await??;
-    rotate_self_keypair(context, &new_key).await?;
-    maybe_ensure_pq_signing_key(context).await?;
-    Ok(())
-}
-
-/// Makes `new_key` the active self key, keeping the previously active key
-/// in the `keypairs` table (still usable for decryption via
-/// [`load_self_secret_keyring`]) until [`maybe_rotate_keypair`] deletes the
-/// row after [`KEY_ROTATION_ROW_GRACE_DAYS`]. Encryption-subkey secrets that
-/// were folded into `new_key` by [`crate::pgp::rotate_encryption_subkey`]
-/// remain until the longer [`KEY_FORGET_SUBKEY_GRACE_DAYS`] window.
-async fn rotate_self_keypair(context: &Context, new_key: &SignedSecretKey) -> Result<()> {
-    let signed_public_key = new_key.to_public_key();
-    let mut config_cache_lock = context.sql.config_cache.write().await;
-    let new_key_id = context
-        .sql
-        .transaction(|transaction| {
-            let public_key = DcKey::to_bytes(&signed_public_key);
-            let secret_key = DcKey::to_bytes(new_key);
-
-            transaction
-                .execute(
-                    "INSERT INTO keypairs (public_key, private_key, created)
-                     VALUES (?,?,?)",
-                    (&public_key, &secret_key, tools::time()),
-                )
-                .context("Failed to insert rotated keypair")?;
-            let new_key_id = transaction.last_insert_rowid();
-
-            transaction.execute(
-                "UPDATE config SET value=? WHERE keyname='key_id'",
-                (new_key_id,),
-            )?;
-            Ok(new_key_id)
-        })
-        .await?;
-    // Invalidate the cached public key / fingerprint so that the new key is
-    // picked up immediately (e.g. in the very next Autocrypt header we send),
-    // rather than only after the next process restart. Both caches are
-    // lazily repopulated from the DB (via `key_id`, which we just updated)
-    // on next access.
-    *context.self_public_key.lock().await = None;
-    *context.self_fingerprint.lock().await = None;
-    context.emit_event(EventType::AccountsItemChanged);
-    config_cache_lock.insert("key_id".to_string(), Some(new_key_id.to_string()));
-    Ok(())
-}
-
-/// Overwrites the currently active key's stored bytes in place with `key`,
-/// without touching its `created` timestamp or its `keypairs` row id, and
-/// without changing which row `key_id` points to.
-///
-/// Unlike [`rotate_self_keypair`], this does not introduce a new key
-/// generation — it's for saving an in-place edit of the current key (e.g.
-/// after [`forget_expired_encryption_subkeys`](crate::pgp::forget_expired_encryption_subkeys)
-/// pruned some of its embedded subkeys), where inserting a fresh row and
-/// old-row grace period would be pointless churn.
-async fn save_current_keypair(context: &Context, key: &SignedSecretKey) -> Result<()> {
-    let public_key = key.to_public_key();
-    let public_key_bytes = DcKey::to_bytes(&public_key);
-    let secret_key_bytes = DcKey::to_bytes(key);
-    context
-        .sql
-        .execute(
-            "UPDATE keypairs SET public_key=?, private_key=?
-             WHERE id=(SELECT value FROM config WHERE keyname='key_id')",
-            (&public_key_bytes, &secret_key_bytes),
-        )
-        .await?;
-    // The public key content changed (fewer advertised subkeys) even though
-    // the fingerprint didn't — drop the cache so the next Autocrypt header
-    // we send reflects it, instead of still advertising a subkey we just
-    // threw the secret half of away.
-    *context.self_public_key.lock().await = None;
     Ok(())
 }
 

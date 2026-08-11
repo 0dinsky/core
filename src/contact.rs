@@ -1230,17 +1230,13 @@ ORDER BY c.origin>=? DESC, c.last_seen DESC, c.id DESC
                 .await?;
 
             if let Some(query) = query {
-                let self_addr = context
-                    .get_config(Config::ConfiguredAddr)
-                    .await?
-                    .unwrap_or_default();
                 let self_name = context
                     .get_config(Config::Displayname)
                     .await?
                     .unwrap_or_default();
                 let self_name2 = stock_str::self_msg(context);
 
-                if self_addr.contains(query)
+                if self_addrs.iter().any(|a| a.contains(query))
                     || self_name.contains(query)
                     || self_name2.contains(query)
                 {
@@ -1439,21 +1435,13 @@ WHERE addr=?
             );
         }
 
-        if let Some(public_key) = contact.public_key(context).await? {
-            if let Some(kind) = crate::pgp::encryption_kind(&public_key) {
-                ret += "\n\nEncryption: ";
-                ret += kind.label();
-                ret += " — this is what will be used for messages sent to ";
-                ret += contact.get_display_name();
-                ret += ". It depends on their key, not on your own settings.";
-            }
-
-            if let Some(relay_addrs) = addresses_from_public_key(&public_key) {
-                ret += "\n\nRelays:";
-                for relay in &relay_addrs {
-                    ret += "\n";
-                    ret += relay;
-                }
+        if let Some(public_key) = contact.public_key(context).await?
+            && let Some(relay_addrs) = addresses_from_public_key(&public_key)
+        {
+            ret += "\n\nRelays:";
+            for relay in &relay_addrs {
+                ret += "\n";
+                ret += relay;
             }
         }
 
@@ -1864,7 +1852,7 @@ pub(crate) async fn set_blocked(
 
         // also (un)block all chats with _only_ this contact - we do not delete them to allow a
         // non-destructive blocking->unblocking.
-        // (Maybe, beside normal chats (type=100) we should also block group chats with only this user.
+        // (Maybe, beside single chats (type=100) we should also block group chats with only this user.
         // However, I'm not sure about this point; it may be confusing if the user wants to add other people;
         // this would result in recreating the same group...)
         if context

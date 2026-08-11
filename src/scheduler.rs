@@ -1,5 +1,8 @@
 use std::cmp;
+use std::future::Future;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
+use std::sync::atomic::Ordering;
 
 use anyhow::{Context as _, Error, Result, bail};
 use async_channel::{self as channel, Receiver, Sender};
@@ -18,9 +21,9 @@ use crate::download::{download_known_post_messages_without_pre_message, download
 use crate::ephemeral;
 use crate::events::EventType;
 use crate::imap::{Imap, session::Session};
-use crate::key;
 use crate::location;
 use crate::log::{LogExt, warn};
+use crate::reaction::broadcast_reactions::maybe_broadcast_reactions;
 use crate::smtp::{Smtp, send_smtp_messages};
 use crate::sql;
 use crate::stats::maybe_send_stats;
@@ -321,6 +324,9 @@ struct SchedBox {
 
     /// IMAP loop task handle.
     handle: task::JoinHandle<()>,
+
+    /// Relay published status.
+    is_published: bool,
 }
 
 /// Job and connection scheduler.
@@ -408,6 +414,12 @@ async fn inbox_loop(
         .await;
 }
 
+/// Same as `context.restart_io_if_running()`, but `Box::pin`ed and with a `+ Send` bound
+/// to break the async type cycle with the IMAP loop it restarts.
+fn restart_io_if_running_boxed(context: Context) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    Box::pin(async move { context.restart_io_if_running().await })
+}
+
 async fn inbox_fetch_idle(ctx: &Context, imap: &mut Imap, mut session: Session) -> Result<Session> {
     let transport_id = session.transport_id();
 
@@ -422,11 +434,11 @@ async fn inbox_fetch_idle(ctx: &Context, imap: &mut Imap, mut session: Session) 
     }
 
     if let Ok(()) = imap.resync_request_receiver.try_recv()
-        && let Err(err) = session.resync_folders(ctx).await
+        && let Err(err) = session.resync_uids_with_server(ctx, &imap.folder).await
     {
         warn!(
             ctx,
-            "Transport {transport_id}: Failed to resync folders: {err:#}."
+            "Transport {transport_id}: Failed to resync UIDs: {err:#}."
         );
         imap.resync_request_sender.try_send(()).ok();
     }
@@ -439,7 +451,6 @@ async fn inbox_fetch_idle(ctx: &Context, imap: &mut Imap, mut session: Session) 
                 last_housekeeping_time.saturating_add(constants::HOUSEKEEPING_PERIOD);
             if next_housekeeping_time <= time() {
                 sql::housekeeping(ctx).await.log_err(ctx).ok();
-                key::maybe_rotate_keypair(ctx).await.log_err(ctx).ok();
             }
         }
         Err(err) => {
@@ -450,6 +461,7 @@ async fn inbox_fetch_idle(ctx: &Context, imap: &mut Imap, mut session: Session) 
         }
     };
 
+    maybe_broadcast_reactions(ctx).await.log_err(ctx).ok();
     maybe_send_stats(ctx).await.log_err(ctx).ok();
 
     session
@@ -492,6 +504,12 @@ async fn fetch_idle(ctx: &Context, connection: &mut Imap, mut session: Session) 
     download_msgs(ctx, &mut session)
         .await
         .context("download_msgs")?;
+
+    if ctx.restart_io_after_fetch.swap(false, Ordering::Relaxed) {
+        // Restarting IO cancels the IMAP loop.
+        // Therefore, we only restart when we're anyways about to go IDLE.
+        task::spawn(restart_io_if_running_boxed(ctx.clone()));
+    }
 
     connection.connectivity.set_idle(ctx);
 
@@ -637,7 +655,9 @@ impl Scheduler {
         let mut inboxes = Vec::new();
         let mut start_recvs = Vec::new();
 
-        for (transport_id, configured_login_param) in ConfiguredLoginParam::load_all(ctx).await? {
+        for (transport_id, configured_login_param, is_published) in
+            ConfiguredLoginParam::load_all(ctx).await?
+        {
             let (conn_state, inbox_handlers) =
                 ImapConnectionState::new(ctx, transport_id, configured_login_param.clone()).await?;
             let (inbox_start_send, inbox_start_recv) = oneshot::channel();
@@ -654,6 +674,7 @@ impl Scheduler {
                 folder,
                 conn_state,
                 handle,
+                is_published,
             };
             inboxes.push(inbox);
             start_recvs.push(inbox_start_recv);

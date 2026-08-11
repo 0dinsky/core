@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
-use std::time::SystemTime;
 
 use anyhow::{Context as _, Result, ensure};
 use deltachat_contact_tools::{EmailAddress, may_be_valid_addr};
@@ -18,12 +17,14 @@ use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::packet::{Signature, Subpacket, SubpacketData};
 use pgp::types::{
     CompressionAlgorithm, Imprint, KeyDetails, KeyVersion, Password, SignedUser, SigningKey as _,
-    StringToKey, Timestamp,
+    StringToKey, Timestamp, PublicKeyAlgorithm,
 };
 use rand_old::{Rng as _, thread_rng};
 use sha2::Sha256;
+use smallvec::smallvec;
 use tokio::runtime::Handle;
 
+use crate::configure::MAX_RELAYS;
 use crate::key::{DcKey, Fingerprint};
 
 /// Preferred symmetric encryption algorithm.
@@ -81,6 +82,7 @@ pub(crate) fn create_keypair(addr: EmailAddress) -> Result<SignedSecretKey> {
 
     Ok(secret_key)
 }
+
 
 /// Creates a hybrid-PQ keypair: a **classic V4 primary** (Ed25519Legacy signing,
 /// exactly like [`create_keypair`]) plus *two* encryption subkeys — a classic
@@ -347,243 +349,14 @@ pub fn is_pq_signing_secret(key: &SignedSecretKey) -> bool {
 /// whose clients understand it can already encrypt PQ-hybrid messages to
 /// this key, regardless of the primary key's own algorithm or version.
 ///
-/// This is the signal [`crate::key::maybe_rotate_keypair`] and
-/// [`crate::key::rotate_keypair_now`] use to decide whether a PQ-mode
-/// rotation needs to *add* a PQ subkey or is already a no-op — deliberately
-/// independent of [`is_pq_signing_secret`], since toggling
-/// `Config::KeyGenMode` only ever changes the encryption subkey set now, not
-/// the primary.
+/// Independent of [`is_pq_signing_secret`], since `Config::KeyGenMode`
+/// only ever changes the encryption subkey set, not the primary.
 pub fn has_pq_encryption_subkey(key: &SignedSecretKey) -> bool {
     key.public_subkeys
         .iter()
         .any(|subkey| classify_encryption_algorithm(subkey.algorithm()) == EncryptionKind::PostQuantum)
 }
 
-/// Build a throwaway keypair whose single purpose is to donate a fresh
-/// encryption subkey of the requested family, version-aligned with `version`
-/// so it can be re-bound onto an existing primary of that version.
-fn create_encryption_subkey_donor(
-    addr: EmailAddress,
-    use_pq_encryption: bool,
-    version: KeyVersion,
-) -> Result<SignedSecretKey> {
-    // Primary is only a vehicle for generating/signing the subkey; match the
-    // parent version so the subkey packet version is compatible.
-    let (primary_type, enc_type) = if use_pq_encryption {
-        // ML-KEM-768+X25519 works as V4 or V6 encryption subkey.
-        // For the temp primary use Ed25519 (V4/V6) — not ML-DSA (V6-only),
-        // so this also works when attaching a PQ subkey to a classic V4 primary.
-        let primary = if version >= KeyVersion::V6 {
-            PgpKeyType::Ed25519
-        } else {
-            PgpKeyType::Ed25519Legacy
-        };
-        (primary, PgpKeyType::MlKem768X25519)
-    } else if version >= KeyVersion::V6 {
-        (PgpKeyType::Ed25519, PgpKeyType::X25519)
-    } else {
-        (
-            PgpKeyType::Ed25519Legacy,
-            PgpKeyType::ECDH(ECCCurve::Curve25519Legacy),
-        )
-    };
-
-    let key_params = SecretKeyParamsBuilder::default()
-        .version(version)
-        .key_type(primary_type)
-        .can_certify(true)
-        .can_sign(true)
-        .primary_user_id(format!("<{addr}>"))
-        .passphrase(None)
-        .subkey(
-            SubkeyParamsBuilder::default()
-                .version(version)
-                .key_type(enc_type)
-                .can_encrypt(EncryptionCaps::All)
-                .passphrase(None)
-                .build()
-                .context("failed to build donor subkey parameters")?,
-        )
-        .build()
-        .context("failed to build donor key parameters")?;
-
-    let mut rng = thread_rng();
-    let secret_key = key_params
-        .generate(&mut rng)
-        .context("Failed to generate donor keypair for encryption subkey rotation")?;
-    Ok(secret_key)
-}
-
-/// Rotates **only the encryption subkey**, keeping the primary key (and thus
-/// the OpenPGP fingerprint) unchanged.
-///
-/// This preserves "Verified" status for contacts who already verified us:
-/// their stored fingerprint still matches our primary key.
-///
-/// Old encryption subkey material remains on the returned key as an additional
-/// subkey so in-flight messages encrypted to the old subkey can still be
-/// decrypted until the key is eventually replaced entirely.
-pub fn rotate_encryption_subkey(
-    existing: &SignedSecretKey,
-    addr: EmailAddress,
-    use_pq_encryption: bool,
-) -> Result<SignedSecretKey> {
-    use pgp::composed::SignedSecretSubKey;
-    use pgp::packet::KeyFlags;
-
-    // Generate a temporary keypair solely to obtain a fresh encryption subkey
-    // of the desired algorithm family. The temp primary version must match the
-    // existing primary: V4 primary cannot bind a V6 subkey (and vice versa).
-    // ML-KEM-768+X25519 is allowed as a V4 encryption subkey; ML-DSA primary
-    // is V6-only (full PQ keypairs go through create_pqc_keypair instead).
-    let parent_version = existing.primary_key.version();
-    let temp = create_encryption_subkey_donor(addr, use_pq_encryption, parent_version)?;
-    let new_sub_key = temp
-        .secret_subkeys
-        .into_iter()
-        .next()
-        .context("temporary keypair has no encryption subkey")?;
-
-    let mut rng = thread_rng();
-    let mut keyflags = KeyFlags::default();
-    // Mark as encryption-capable (storage + communications).
-    keyflags.set_encrypt_comms(true);
-    keyflags.set_encrypt_storage(true);
-
-    let binding_sig = new_sub_key.key.sign(
-        &mut rng,
-        &existing.primary_key,
-        existing.primary_key.public_key(),
-        &Password::empty(),
-        keyflags,
-        None,
-    )?;
-
-    let new_signed_sub = SignedSecretSubKey::new(new_sub_key.key, vec![binding_sig]);
-    let new_pub_sub = SignedPublicSubKey {
-        key: new_signed_sub.public_key().clone(),
-        signatures: new_signed_sub.signatures.clone(),
-    };
-
-    // New encryption subkey first (preferred); keep old subkeys for decryption.
-    let mut secret_subkeys = vec![new_signed_sub];
-    secret_subkeys.extend(existing.secret_subkeys.clone());
-    let mut public_subkeys = vec![new_pub_sub];
-    public_subkeys.extend(existing.public_subkeys.clone());
-
-    let rotated = SignedSecretKey {
-        primary_key: existing.primary_key.clone(),
-        details: existing.details.clone(),
-        public_subkeys,
-        secret_subkeys,
-    };
-    rotated
-        .verify_bindings()
-        .context("rotated key failed binding verification")?;
-    Ok(rotated)
-}
-
-/// Minimum number of encryption subkeys that must always remain, regardless
-/// of age. Protects multi-device setups and in-flight mail: even if the
-/// oldest subkeys are past `cutoff`, we never drop below this many secrets.
-///
-/// A second device that was set up from an Autocrypt Setup Message / QR
-/// only receives the *current* key. As long as that key still embeds the
-/// recent encryption subkeys, the second device can decrypt messages that
-/// were encrypted to those subkeys. Aggressive pruning would make lagging
-/// or newly-added devices unable to decrypt — the classic multi-device
-/// rotation failure mode.
-const MIN_RETAINED_ENCRYPTION_SUBKEYS: usize = 2;
-
-/// Permanently discards the private key material of encryption subkeys
-/// created before `cutoff`, while always keeping at least
-/// [`MIN_RETAINED_ENCRYPTION_SUBKEYS`] newest ones.
-///
-/// OpenPGP has no native perfect forward secrecy. The best approximation is
-/// periodic encryption-subkey rotation followed by eventual deletion of old
-/// secret material (this function). Autocrypt v2 calls the same idea
-/// "pretty good forward secrecy".
-///
-/// [`rotate_encryption_subkey`] alone does **not** provide forward secrecy:
-/// it keeps every previous encryption subkey around so that messages already
-/// in flight (and second devices that still hold an older copy of the key)
-/// can still decrypt. This function is the actual "forget" step.
-///
-/// # Multi-device safety
-///
-/// Call this only with a **conservative** `cutoff` (weeks, not days). If you
-/// prune too early:
-/// - a second device that has not yet received the updated private key will
-///   be unable to decrypt messages encrypted to the forgotten subkeys;
-/// - a newly added second device (Setup Message / QR) only gets the current
-///   key — if recent subkeys were already forgotten, historical mail that
-///   used them becomes permanently unreadable on that device.
-///
-/// Never add a "recovery by re-encryption" path: that would re-introduce the
-/// material this function erases and defeat the purpose.
-///
-/// Fails without modifying anything if pruning would leave fewer than
-/// [`MIN_RETAINED_ENCRYPTION_SUBKEYS`] encryption subkeys (or zero).
-pub fn forget_expired_encryption_subkeys(
-    existing: &SignedSecretKey,
-    cutoff: SystemTime,
-) -> Result<SignedSecretKey> {
-    let cutoff: Timestamp = cutoff
-        .try_into()
-        .context("cutoff time is not representable as an OpenPGP timestamp")?;
-
-    // Sort newest-first so "keep at least N newest" is unambiguous.
-    let mut ordered: Vec<_> = existing.secret_subkeys.iter().cloned().collect();
-    ordered.sort_by_key(|sub| std::cmp::Reverse(sub.key.created_at()));
-
-    let mut secret_subkeys: Vec<_> = ordered
-        .iter()
-        .filter(|sub| sub.key.created_at() >= cutoff)
-        .cloned()
-        .collect();
-
-    // Always retain the newest MIN_RETAINED_ENCRYPTION_SUBKEYS, even if they
-    // are older than cutoff. This is the multi-device / in-flight safety net.
-    if secret_subkeys.len() < MIN_RETAINED_ENCRYPTION_SUBKEYS {
-        secret_subkeys = ordered
-            .into_iter()
-            .take(MIN_RETAINED_ENCRYPTION_SUBKEYS)
-            .collect();
-    }
-
-    ensure!(
-        !secret_subkeys.is_empty(),
-        "refusing to prune: no encryption subkey would remain afterwards"
-    );
-
-    // If nothing would actually be removed, signal that to the caller so it
-    // does not rewrite the DB for no reason.
-    ensure!(
-        secret_subkeys.len() < existing.secret_subkeys.len(),
-        "nothing to prune: all encryption subkeys are still within grace or under the retention floor"
-    );
-
-    // Keep only the public subkeys whose secret counterpart survived pruning,
-    // so the public and secret halves of the key stay in sync.
-    let retained: HashSet<_> = secret_subkeys.iter().map(|sub| sub.key.fingerprint()).collect();
-    let public_subkeys: Vec<_> = existing
-        .public_subkeys
-        .iter()
-        .filter(|sub| retained.contains(&sub.key.fingerprint()))
-        .cloned()
-        .collect();
-
-    let pruned = SignedSecretKey {
-        primary_key: existing.primary_key.clone(),
-        details: existing.details.clone(),
-        public_subkeys,
-        secret_subkeys,
-    };
-    pruned
-        .verify_bindings()
-        .context("pruned key failed binding verification")?;
-    Ok(pruned)
-}
 
 /// Version of SEIPD packet to use.
 ///
@@ -602,96 +375,95 @@ pub enum SeipdVersion {
 /// Encrypts `plain` text using `public_keys_for_encryption`
 /// and signs it using `private_key_for_signing`.
 #[expect(clippy::arithmetic_side_effects)]
-fn signature_subpackets(
-    private_key_for_signing: &SignedSecretKey,
-    public_keys_for_encryption: &[SignedPublicKey],
-) -> Result<SubpacketConfig> {
-    let mut hashed = Vec::with_capacity(1 + public_keys_for_encryption.len() + 1);
-    hashed.push(Subpacket::critical(SubpacketData::SignatureCreationTime(
-        pgp::types::Timestamp::now(),
-    ))?);
-    for key in public_keys_for_encryption {
-        let data = SubpacketData::IntendedRecipientFingerprint(key.fingerprint());
-        let subpkt = match private_key_for_signing.version() < KeyVersion::V6 {
-            true => Subpacket::regular(data)?,
-            false => Subpacket::critical(data)?,
-        };
-        hashed.push(subpkt);
-    }
-    hashed.push(Subpacket::regular(SubpacketData::IssuerFingerprint(
-        private_key_for_signing.fingerprint(),
-    ))?);
-    let mut unhashed = vec![];
-    if private_key_for_signing.version() <= KeyVersion::V4 {
-        unhashed.push(Subpacket::regular(SubpacketData::IssuerKeyId(
-            private_key_for_signing.legacy_key_id(),
-        ))?);
-    }
-    Ok(SubpacketConfig::UserDefined { hashed, unhashed })
-}
-
-/// Always classic identity signature. Optional second PQ signature only when
-/// every recipient is PQ-capable — classic Delta Chat never sees ML-DSA packets.
-pub async fn pk_encrypt(
+pub fn pk_encrypt(
     plain: Vec<u8>,
     public_keys_for_encryption: Vec<SignedPublicKey>,
     private_key_for_signing: SignedSecretKey,
-    extra_pq_signing_key: Option<SignedSecretKey>,
     compress: bool,
     seipd_version: SeipdVersion,
 ) -> Result<String> {
-    Handle::current()
-        .spawn_blocking(move || {
-            let mut rng = thread_rng();
-            let pkeys: Vec<_> = public_keys_for_encryption
-                .iter()
-                .filter_map(select_pk_for_encryption)
-                .collect();
-            let classic_subpkts =
-                signature_subpackets(&private_key_for_signing, &public_keys_for_encryption)?;
-            let pq_subpkts = extra_pq_signing_key
-                .as_ref()
-                .map(|k| signature_subpackets(k, &public_keys_for_encryption))
-                .transpose()?;
-            let msg = MessageBuilder::from_bytes("", plain);
-            let encoded_msg = match seipd_version {
-                SeipdVersion::V1 => {
-                    let mut msg = msg.seipd_v1(&mut rng, SYMMETRIC_KEY_ALGORITHM);
-                    for pkey in &pkeys {
-                        msg.encrypt_to_key_anonymous(&mut rng, pkey)?;
-                    }
-                    msg.sign_with_subpackets(
-                        &*private_key_for_signing, Password::empty(),
-                        private_key_for_signing.hash_alg(), classic_subpkts,
-                    );
-                    if let (Some(pq_key), Some(subpkts)) = (extra_pq_signing_key.as_ref(), pq_subpkts) {
-                        msg.sign_with_subpackets(&**pq_key, Password::empty(), pq_key.hash_alg(), subpkts);
-                    }
-                    if compress { msg.compression(CompressionAlgorithm::ZLIB); }
-                    msg.to_armored_string(&mut rng, Default::default())?
-                }
-                SeipdVersion::V2 => {
-                    let mut msg = msg.seipd_v2(
-                        &mut rng, SYMMETRIC_KEY_ALGORITHM, AeadAlgorithm::Ocb, ChunkSize::C8KiB,
-                    );
-                    for pkey in &pkeys {
-                        msg.encrypt_to_key_anonymous(&mut rng, pkey)?;
-                    }
-                    msg.sign_with_subpackets(
-                        &*private_key_for_signing, Password::empty(),
-                        private_key_for_signing.hash_alg(), classic_subpkts,
-                    );
-                    if let (Some(pq_key), Some(subpkts)) = (extra_pq_signing_key.as_ref(), pq_subpkts) {
-                        msg.sign_with_subpackets(&**pq_key, Password::empty(), pq_key.hash_alg(), subpkts);
-                    }
-                    if compress { msg.compression(CompressionAlgorithm::ZLIB); }
-                    msg.to_armored_string(&mut rng, Default::default())?
-                }
-            };
+    tokio::task::block_in_place(|| {
+        let mut rng = thread_rng();
 
-            Ok(encoded_msg)
-        })
-        .await?
+        let pkeys = public_keys_for_encryption
+            .iter()
+            .filter_map(select_pk_for_encryption);
+        let subpkts = {
+            let mut hashed = Vec::with_capacity(1 + public_keys_for_encryption.len() + 1);
+            hashed.push(Subpacket::critical(SubpacketData::SignatureCreationTime(
+                pgp::types::Timestamp::now(),
+            ))?);
+            for key in &public_keys_for_encryption {
+                let data = SubpacketData::IntendedRecipientFingerprint(key.fingerprint());
+                let subpkt = match private_key_for_signing.version() < KeyVersion::V6 {
+                    true => Subpacket::regular(data)?,
+                    false => Subpacket::critical(data)?,
+                };
+                hashed.push(subpkt);
+            }
+            hashed.push(Subpacket::regular(SubpacketData::IssuerFingerprint(
+                private_key_for_signing.fingerprint(),
+            ))?);
+            let mut unhashed = vec![];
+            if private_key_for_signing.version() <= KeyVersion::V4 {
+                unhashed.push(Subpacket::regular(SubpacketData::IssuerKeyId(
+                    private_key_for_signing.legacy_key_id(),
+                ))?);
+            }
+            SubpacketConfig::UserDefined { hashed, unhashed }
+        };
+
+        let msg = MessageBuilder::from_bytes("", plain);
+        let encoded_msg = match seipd_version {
+            SeipdVersion::V1 => {
+                let mut msg = msg.seipd_v1(&mut rng, SYMMETRIC_KEY_ALGORITHM);
+
+                for pkey in pkeys {
+                    msg.encrypt_to_key_anonymous(&mut rng, &pkey)?;
+                }
+
+                let hash_algorithm = private_key_for_signing.hash_alg();
+                msg.sign_with_subpackets(
+                    &*private_key_for_signing,
+                    Password::empty(),
+                    hash_algorithm,
+                    subpkts,
+                );
+                if compress {
+                    msg.compression(CompressionAlgorithm::ZLIB);
+                }
+
+                msg.to_armored_string(&mut rng, Default::default())?
+            }
+            SeipdVersion::V2 => {
+                let mut msg = msg.seipd_v2(
+                    &mut rng,
+                    SYMMETRIC_KEY_ALGORITHM,
+                    AeadAlgorithm::Ocb,
+                    ChunkSize::C8KiB,
+                );
+
+                for pkey in pkeys {
+                    msg.encrypt_to_key_anonymous(&mut rng, &pkey)?;
+                }
+
+                let hash_algorithm = private_key_for_signing.hash_alg();
+                msg.sign_with_subpackets(
+                    &*private_key_for_signing,
+                    Password::empty(),
+                    hash_algorithm,
+                    subpkts,
+                );
+                if compress {
+                    msg.compression(CompressionAlgorithm::ZLIB);
+                }
+
+                msg.to_armored_string(&mut rng, Default::default())?
+            }
+        };
+
+        Ok(encoded_msg)
+    })
 }
 
 /// Returns fingerprints
@@ -752,35 +524,37 @@ pub fn symm_encrypt_message(
     shared_secret: String,
     compress: bool,
 ) -> Result<String> {
-    let shared_secret = Password::from(shared_secret);
+    tokio::task::block_in_place(|| {
+        let shared_secret = Password::from(shared_secret);
 
-    let msg = MessageBuilder::from_bytes("", plain);
-    let mut rng = thread_rng();
-    let mut salt = [0u8; 8];
-    rng.fill(&mut salt[..]);
-    let s2k = StringToKey::Salted {
-        hash_alg: HashAlgorithm::default(),
-        salt,
-    };
-    let mut msg = msg.seipd_v2(
-        &mut rng,
-        SYMMETRIC_KEY_ALGORITHM,
-        AeadAlgorithm::Ocb,
-        ChunkSize::C8KiB,
-    );
-    msg.encrypt_with_password(&mut rng, s2k, &shared_secret)?;
+        let msg = MessageBuilder::from_bytes("", plain);
+        let mut rng = thread_rng();
+        let mut salt = [0u8; 8];
+        rng.fill(&mut salt[..]);
+        let s2k = StringToKey::Salted {
+            hash_alg: HashAlgorithm::default(),
+            salt,
+        };
+        let mut msg = msg.seipd_v2(
+            &mut rng,
+            SYMMETRIC_KEY_ALGORITHM,
+            AeadAlgorithm::Ocb,
+            ChunkSize::C8KiB,
+        );
+        msg.encrypt_with_password(&mut rng, s2k, &shared_secret)?;
 
-    if let Some(private_key_for_signing) = private_key_for_signing.as_deref() {
-        let hash_algorithm = private_key_for_signing.hash_alg();
-        msg.sign(private_key_for_signing, Password::empty(), hash_algorithm);
-    }
-    if compress {
-        msg.compression(CompressionAlgorithm::ZLIB);
-    }
+        if let Some(private_key_for_signing) = private_key_for_signing.as_deref() {
+            let hash_algorithm = private_key_for_signing.hash_alg();
+            msg.sign(private_key_for_signing, Password::empty(), hash_algorithm);
+        }
+        if compress {
+            msg.compression(CompressionAlgorithm::ZLIB);
+        }
 
-    let encoded_msg = msg.to_armored_string(&mut rng, Default::default())?;
+        let encoded_msg = msg.to_armored_string(&mut rng, Default::default())?;
 
-    Ok(encoded_msg)
+        Ok(encoded_msg)
+    })
 }
 
 /// Merges and minimizes OpenPGP certificates.
@@ -911,7 +685,13 @@ pub fn merge_openpgp_certificates(
 
 /// Returns relays addresses from the public key signature.
 ///
-/// Not more than 3 relays are returned for each key.
+/// Not more than [`MAX_RELAYS`] relays are returned for each key.
+/// This is the same constant as the maximum number of published relays
+/// the user is allowed to have in the key.
+/// If the constant is changed in the future,
+/// the client with the lower constant value
+/// will ignore some relays advertised in the key,
+/// but still send to the first [`MAX_RELAYS`].
 pub(crate) fn addresses_from_public_key(public_key: &SignedPublicKey) -> Option<Vec<String>> {
     for signature in &public_key.details.direct_signatures {
         // The signature should be verified already when importing the key,
@@ -928,7 +708,7 @@ pub(crate) fn addresses_from_public_key(public_key: &SignedPublicKey) -> Option<
                             .split(",")
                             .map(|s| s.to_string())
                             .filter(|s| may_be_valid_addr(s))
-                            .take(3)
+                            .take(MAX_RELAYS)
                             .collect(),
                     );
                 }
@@ -977,7 +757,7 @@ mod tests {
         config::Config,
         decrypt,
         key::{load_self_public_key, self_fingerprint, store_self_keypair},
-        mimefactory::{render_outer_message, wrap_encrypted_part},
+        mimefactory::{part_to_bytes, wrap_encrypted_part},
         test_utils::{TestContext, TestContextManager, alice_keypair, bob_keypair},
         token,
     };
@@ -1003,9 +783,9 @@ mod tests {
         store_self_keypair(t, secret_key).await?;
 
         let mime_message = wrap_encrypted_part(bytes.try_into().unwrap());
-        let rendered = render_outer_message(vec![], mime_message);
-        let parsed = mailparse::parse_mail(rendered.as_bytes())?;
-        let (decrypted, _fp, _key_kind) = decrypt::decrypt(t, &parsed).await?.unwrap();
+        let rendered = part_to_bytes(mime_message);
+        let parsed = mailparse::parse_mail(&rendered)?;
+        let (decrypted, _fp) = decrypt::decrypt(t, &parsed).await?.unwrap();
         Ok(decrypted)
     }
 
@@ -1031,47 +811,6 @@ mod tests {
         let keypair0 = create_keypair(EmailAddress::new("foo@bar.de").unwrap()).unwrap();
         let keypair1 = create_keypair(EmailAddress::new("two@zwo.de").unwrap()).unwrap();
         assert_ne!(keypair0.public_key(), keypair1.public_key());
-    }
-
-    /// `create_pqc_keypair` must produce a **V4** primary (so any classic
-    /// OpenPGP client can still parse and encrypt to it) carrying *two*
-    /// encryption subkeys: one classic, one PQ hybrid. This is what lets PQ
-    /// contacts get PQ encryption while non-PQ contacts keep working
-    /// unmodified — see the function's doc comment for the full rationale.
-    #[test]
-    fn test_create_pqc_keypair_is_v4_primary_with_dual_subkeys() {
-        let keypair = create_pqc_keypair(EmailAddress::new("pq@example.org").unwrap()).unwrap();
-
-        assert_eq!(keypair.primary_key.version(), KeyVersion::V4);
-        assert!(!is_pq_signing_secret(&keypair), "primary must stay classic");
-
-        let encrypt_subkeys: Vec<_> = keypair
-            .public_subkeys
-            .iter()
-            .filter(|sk| sk.algorithm().can_encrypt())
-            .collect();
-        assert_eq!(encrypt_subkeys.len(), 2, "want one classic + one PQ subkey");
-        assert!(
-            encrypt_subkeys
-                .iter()
-                .any(|sk| classify_encryption_algorithm(sk.algorithm()) == EncryptionKind::Classic)
-        );
-        assert!(has_pq_encryption_subkey(&keypair));
-
-        // Our own selection must prefer the PQ subkey when both are present.
-        let public_key = keypair.to_public_key();
-        assert_eq!(encryption_kind(&public_key), Some(EncryptionKind::PostQuantum));
-    }
-
-    /// A contact whose key has *no* PQ subkey (e.g. a plain classic key)
-    /// must still resolve to classic encryption — the whole point of the
-    /// dual-subkey design is that PQ activates only when the recipient's
-    /// own key advertises it, with no explicit negotiation needed.
-    #[test]
-    fn test_select_pk_for_encryption_falls_back_to_classic() {
-        let classic = create_keypair(EmailAddress::new("classic@example.org").unwrap()).unwrap();
-        let public_key = classic.to_public_key();
-        assert_eq!(encryption_kind(&public_key), Some(EncryptionKind::Classic));
     }
 
     /// [SignedSecretKey] and [SignedPublicKey] objects
@@ -1115,11 +854,9 @@ mod tests {
                     CLEARTEXT.to_vec(),
                     keyring,
                     KEYS.alice_secret.clone(),
-                    None,
                     compress,
                     SeipdVersion::V2,
                 )
-                .await
                 .unwrap()
             })
             .await
@@ -1308,11 +1045,9 @@ mod tests {
             plain,
             vec![pk_for_encryption],
             KEYS.alice_secret.clone(),
-            None,
             compress,
             SeipdVersion::V2,
-        )
-        .await?;
+        )?;
 
         // Trying to decrypt it should fail with an OK error message:
         let bob_private_keyring = crate::key::load_self_secret_keyring(bob).await?;

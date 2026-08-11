@@ -70,8 +70,11 @@ pub enum Param {
     /// For Messages
     WantsMdn = b'r',
 
-    /// For Messages: the message is a reaction.
+    /// For Messages: Render message as a RFC 9078 reaction.
     Reaction = b'x',
+
+    /// For Messages: Additional reactions that go to the `Chat-Broadcast-States:` header
+    BroadcastReactions = b'X',
 
     /// For Chats: the timestamp of the last reaction.
     LastReactionTimestamp = b'y',
@@ -266,12 +269,6 @@ pub enum Param {
 
     /// For (pre-)Message: File byte size of Post-Message attachment
     PostMessageFileBytes = b'9',
-
-    /// For incoming Messages: which algorithm family of our own secret key
-    /// actually decrypted this message ("classic" or "pq"), if it was
-    /// asymmetrically OpenPGP-encrypted and this could be determined.
-    /// Not set for outgoing, unencrypted, or symmetrically-encrypted messages.
-    DecryptionKeyKind = b'X',
 }
 
 /// An object for handling key=value parameter lists.

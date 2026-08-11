@@ -29,25 +29,26 @@ enum SetupContactCase {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_setup_contact_basic() {
-    test_setup_contact_ex(SetupContactCase::Normal).await
+    test_setup_contact_ex(SetupContactCase::Normal).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_setup_contact_wrong_alice_gossip() {
-    test_setup_contact_ex(SetupContactCase::WrongAliceGossip).await
+    let (alice, _) = test_setup_contact_ex(SetupContactCase::WrongAliceGossip).await;
+    alice.assert_warn("No self addr+pubkey gossip found").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_setup_contact_alice_is_bot() {
-    test_setup_contact_ex(SetupContactCase::AliceIsBot).await
+    test_setup_contact_ex(SetupContactCase::AliceIsBot).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_setup_contact_alice_has_name() {
-    test_setup_contact_ex(SetupContactCase::AliceHasName).await
+    test_setup_contact_ex(SetupContactCase::AliceHasName).await;
 }
 
-async fn test_setup_contact_ex(case: SetupContactCase) {
+async fn test_setup_contact_ex(case: SetupContactCase) -> (TestContext, TestContext) {
     let _n = TimeShiftFalsePositiveNote;
 
     let mut tcm = TestContextManager::new();
@@ -217,7 +218,7 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
             .unwrap();
         assert_eq!(handshake_msg, HandshakeMessage::Ignore);
         assert!(contact_bob.is_verified(&alice).await.unwrap());
-        return;
+        return (alice, bob);
     }
 
     // Alice should not yet have Bob verified
@@ -235,7 +236,7 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
     assert!(contact_bob.get_name().is_empty());
     assert_eq!(contact_bob.is_bot(), false);
 
-    // exactly one one-to-one chat should be visible for both now
+    // exactly one single chat should be visible for both now
     // (check this before calling alice.get_chat() explicitly below)
     assert_eq!(
         Chatlist::try_load(&alice, 0, None, None)
@@ -249,7 +250,7 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
         1
     );
 
-    // Check Alice got the verified message in her 1:1 chat.
+    // Check Alice got the verified message in her single chat.
     {
         let chat = alice.get_chat(&bob).await;
         let msg = get_chat_msg(&alice, chat.get_id(), 0, 1).await;
@@ -300,6 +301,8 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
     let msg = get_chat_msg(&bob, bob_chat.get_id(), 0, 1).await;
     assert!(msg.is_info());
     assert_eq!(msg.get_text(), messages_e2ee_info_msg(&bob));
+
+    (alice, bob)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -307,6 +310,8 @@ async fn test_setup_contact_bad_qr() {
     let bob = TestContext::new_bob().await;
     let ret = join_securejoin(&bob.ctx, "not a qr code").await;
     assert!(ret.is_err());
+    bob.assert_warn("Unsupported QR type").await;
+    bob.assert_error("QR process failed").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -620,7 +625,7 @@ async fn test_secure_join_group_ex(v3: bool, remove_invite: bool) -> Result<()> 
             assert_eq!(
                 chat.blocked,
                 Blocked::Yes,
-                "Alice's 1:1 chat with Bob is not hidden"
+                "Alice's single chat with Bob is not hidden"
             );
         }
 
@@ -648,7 +653,7 @@ async fn test_secure_join_group_ex(v3: bool, remove_invite: bool) -> Result<()> 
         assert_eq!(
             chat.blocked,
             Blocked::Yes,
-            "Bob's 1:1 chat with Alice is not hidden"
+            "Bob's single chat with Alice is not hidden"
         );
         for item in chat::get_chat_msgs(&bob.ctx, bob_chatid).await.unwrap() {
             if let chat::ChatItem::Message { msg_id } = item {
@@ -667,12 +672,12 @@ async fn test_secure_join_group_ex(v3: bool, remove_invite: bool) -> Result<()> 
     assert_eq!(chat::get_chat_contacts(&bob, bob_chatid).await?.len(), 2);
 
     // On this "happy path", Alice and Bob get only a group-chat where all information are added to.
-    // The one-to-one chats are used internally for the hidden handshake messages,
+    // The single chats are used internally for the hidden handshake messages,
     // however, should not be visible in the UIs.
     assert_eq!(Chatlist::try_load(&alice, 0, None, None).await?.len(), 1);
     assert_eq!(Chatlist::try_load(&bob, 0, None, None).await?.len(), 1);
 
-    // If Bob then sends a direct message to alice, however, the one-to-one with Alice should appear.
+    // If Bob then sends a single chat message to alice, however, the single chat with Alice should appear.
     let bobs_chat_with_alice = bob.create_chat(&alice).await;
     let sent = bob.send_text(bobs_chat_with_alice.id, "Hello").await;
     alice.recv_msg(&sent).await;
@@ -791,6 +796,7 @@ First thread."#;
     let chat_id = msg.chat_id;
 
     assert!(get_securejoin_qr(&alice, Some(chat_id)).await.is_err());
+    alice.assert_error("Can't generate QR code").await;
     Ok(())
 }
 
@@ -983,6 +989,13 @@ async fn test_parallel_setup_contact(bob_deletes_fiona_contact: bool) -> Result<
     let bob_alice_contact = Contact::get_by_id(bob, bob_alice_contact_id).await.unwrap();
     assert_eq!(bob_alice_contact.is_verified(bob).await.unwrap(), true);
 
+    bob.assert_warn("Message does not match expected fingerprint")
+        .await;
+    if bob_deletes_fiona_contact {
+        bob.assert_warn("Message does not match expected fingerprint")
+            .await;
+    }
+
     Ok(())
 }
 
@@ -1013,7 +1026,7 @@ async fn test_wrong_auth_token() -> Result<()> {
 
     let alice_bob_contact = alice.add_or_lookup_contact(bob).await;
     assert!(!alice_bob_contact.is_verified(alice).await?);
-
+    alice.assert_warn("invalid auth code").await;
     Ok(())
 }
 
@@ -1377,6 +1390,10 @@ async fn test_qr_no_implicit_inviter_addition() -> Result<()> {
     let charlie_chat_contacts = chat::get_chat_contacts(charlie, charlie_chat_id).await?;
     assert_eq!(charlie_chat_contacts.len(), 2);
 
+    bob.assert_error("self not in group").await;
+    bob.assert_warn("the account is not part of the group/broadcast")
+        .await;
+
     Ok(())
 }
 
@@ -1588,6 +1605,9 @@ async fn test_auth_token_is_synchronized() -> Result<()> {
         .unwrap();
     assert_eq!(auth_count, 2);
 
+    bob.assert_warn("Could not find symmetric secret for session key")
+        .await;
+    bob.assert_warn("unencrypted message").await;
     Ok(())
 }
 

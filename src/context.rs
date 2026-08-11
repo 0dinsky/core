@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use anyhow::{Result, bail, ensure};
@@ -233,8 +233,8 @@ pub struct InnerContext {
     running_state: RwLock<RunningState>,
     /// Mutex to prevent a race condition when a "your pw is wrong" warning is sent, resulting in multiple messages being sent.
     pub(crate) wrong_pw_warning_mutex: Mutex<()>,
-    /// Mutex to prevent running housekeeping from multiple threads at once.
-    pub(crate) housekeeping_mutex: Mutex<()>,
+    /// Mutex to prevent running housekeeping or relay management from multiple threads at once.
+    pub(crate) background_task_mutex: Mutex<()>,
 
     /// Mutex to prevent multiple IMAP loops from fetching the messages at once.
     ///
@@ -259,13 +259,21 @@ pub struct InnerContext {
     /// This causes [`Context::wait_next_msgs`] to wake up.
     pub(crate) new_msgs_notify: Notify,
 
+    /// Whether IO should be restarted after the current fetch cycle completed.
+    ///
+    /// Set when a fetched transport sync message modified the transports.
+    /// Restarting from within the inbox loop would cancel it,
+    /// losing the remaining processing of the sync message
+    /// which is already stored and is never fetched again.
+    pub(crate) restart_io_after_fetch: AtomicBool,
+
     /// Server ID response if ID capability is supported
     /// and the server returned non-NIL on the inbox connection.
     /// <https://datatracker.ietf.org/doc/html/rfc2971>
     pub(crate) server_id: RwLock<Option<HashMap<String, String>>>,
 
-    /// IMAP METADATA.
-    pub(crate) metadata: RwLock<Option<ServerMetadata>>,
+    /// IMAP METADATA, per transport id.
+    pub(crate) metadata: RwLock<BTreeMap<u32, ServerMetadata>>,
 
     /// ID for this `Context` in the current process.
     ///
@@ -293,12 +301,8 @@ pub struct InnerContext {
     /// because the lock is used from synchronous [`Context::emit_event`].
     pub(crate) debug_logging: std::sync::RwLock<Option<DebugLogging>>,
 
-    /// Push subscriber to store device token
-    /// and register for heartbeat notifications.
+    /// Push subscriber to store device token.
     pub(crate) push_subscriber: PushSubscriber,
-
-    /// True if account has subscribed to push notifications via IMAP.
-    pub(crate) push_subscribed: AtomicBool,
 
     /// TLS session resumption cache.
     pub(crate) tls_session_store: TlsSessionStore,
@@ -314,13 +318,9 @@ pub struct InnerContext {
     pub(crate) iroh: Arc<RwLock<Option<Iroh>>>,
 
     /// The own fingerprint, if it was computed already.
-    ///
-    /// This used to be a `std::sync::OnceLock`, which is smaller and faster,
-    /// but can only ever be set once — incompatible with `Config::KeyRotationPeriod`
-    /// changing the active key (and therefore the fingerprint) during the
-    /// lifetime of a `Context`. A `Mutex` lets [`crate::key::rotate_self_keypair`]
-    /// invalidate the cache on rotation, same as `self_public_key` below.
-    pub(crate) self_fingerprint: Mutex<Option<String>>,
+    /// tokio::sync::OnceCell would be possible to use, but overkill for our usecase;
+    /// the standard library's OnceLock is enough, and it's a lot smaller in memory.
+    pub(crate) self_fingerprint: OnceLock<String>,
 
     /// OpenPGP certificate aka Transferrable Public Key.
     ///
@@ -329,9 +329,9 @@ pub struct InnerContext {
     /// Mutex is also held while generating the key to avoid generating the key twice.
     pub(crate) self_public_key: Mutex<Option<SignedPublicKey>>,
 
-    /// `Connectivity` values for mailboxes, unordered. Used to compute the aggregate connectivity,
+    /// `Connectivity` values for published relays, unordered. Used to compute the aggregate connectivity,
     /// see [`Context::get_connectivity()`].
-    pub(crate) connectivities: parking_lot::Mutex<Vec<ConnectivityStore>>,
+    pub(crate) published_connectivities: parking_lot::Mutex<Vec<ConnectivityStore>>,
 }
 
 /// The state of ongoing process.
@@ -487,7 +487,7 @@ impl Context {
             running_state: RwLock::new(Default::default()),
             sql: Sql::new(dbfile),
             wrong_pw_warning_mutex: Mutex::new(()),
-            housekeeping_mutex: Mutex::new(()),
+            background_task_mutex: Mutex::new(()),
             fetch_msgs_mutex: Mutex::new(()),
             translated_stockstrings: stockstrings,
             events,
@@ -495,20 +495,20 @@ impl Context {
             ratelimit: RwLock::new(Ratelimit::new(Duration::new(3, 0), 3.0)), // Allow at least 1 message every second + a burst of 3.
             quota: RwLock::new(BTreeMap::new()),
             new_msgs_notify,
+            restart_io_after_fetch: AtomicBool::new(false),
             server_id: RwLock::new(None),
-            metadata: RwLock::new(None),
+            metadata: RwLock::new(BTreeMap::new()),
             creation_time: tools::Time::now(),
             last_error: parking_lot::RwLock::new("".to_string()),
             migration_error: parking_lot::RwLock::new(None),
             debug_logging: std::sync::RwLock::new(None),
             push_subscriber,
-            push_subscribed: AtomicBool::new(false),
             tls_session_store: TlsSessionStore::new(),
             spki_hash_store: SpkiHashStore::new(),
             iroh: Arc::new(RwLock::new(None)),
-            self_fingerprint: Mutex::new(None),
+            self_fingerprint: OnceLock::new(),
             self_public_key: Mutex::new(None),
-            connectivities: parking_lot::Mutex::new(Vec::new()),
+            published_connectivities: parking_lot::Mutex::new(Vec::new()),
         };
 
         let ctx = Context {
@@ -576,21 +576,26 @@ impl Context {
         self.get_config_bool(Config::IsChatmail).await
     }
 
-    /// Returns maximum number of recipients the provider allows to send a single email to.
-    pub(crate) async fn get_max_smtp_rcpt_to(&self) -> Result<usize> {
-        let is_chatmail = self.is_chatmail().await?;
-        let val = self
-            .get_configured_provider()
-            .await?
-            .and_then(|provider| provider.opt.max_smtp_rcpt_to)
-            .map_or_else(
-                || match is_chatmail {
-                    true => constants::DEFAULT_CHATMAIL_MAX_SMTP_RCPT_TO,
-                    false => constants::DEFAULT_MAX_SMTP_RCPT_TO,
-                },
-                usize::from,
-            );
-        Ok(val)
+    /// Returns maximum number of recipients a single email can be sent to.
+    pub(crate) async fn get_max_smtp_rcpt_to(&self) -> Result<u32> {
+        let Some((transport_id, param)) = ConfiguredLoginParam::load(self).await? else {
+            bail!("Not configured");
+        };
+        let metadata_limit = self
+            .metadata
+            .read()
+            .await
+            .get(&transport_id)
+            .and_then(|metadata| metadata.max_smtp_rcpt_to);
+        if let Some(limit) = metadata_limit {
+            return Ok(limit);
+        }
+        if let Some(limit) =
+            crate::provider::legacy_settings_for_addr(&param.addr)?.max_smtp_rcpt_to
+        {
+            return Ok(limit);
+        }
+        Ok(constants::DEFAULT_MAX_SMTP_RCPT_TO)
     }
 
     /// Does a single round of fetching from IMAP and returns.
@@ -840,7 +845,7 @@ impl Context {
         let all_transports: Vec<String> = ConfiguredLoginParam::load_all(self)
             .await?
             .into_iter()
-            .map(|(transport_id, param)| format!("{transport_id}: {param}"))
+            .map(|(transport_id, param, _)| format!("{transport_id}: {param}"))
             .collect();
         let all_transports = if all_transports.is_empty() {
             "Not configured".to_string()
@@ -924,7 +929,7 @@ impl Context {
                 .unwrap_or_else(|| "<unset>".to_string()),
         );
 
-        if let Some(metadata) = &*self.metadata.read().await {
+        if let Some(metadata) = self.metadata.read().await.values().next() {
             if let Some(comment) = &metadata.comment {
                 res.insert("imap_server_comment", format!("{comment:?}"));
             }
@@ -963,6 +968,12 @@ impl Context {
         res.insert(
             "last_housekeeping",
             self.get_config_int(Config::LastHousekeeping)
+                .await?
+                .to_string(),
+        );
+        res.insert(
+            "last_reactions_broadcast",
+            self.get_config_int(Config::LastReactionsBroadcast)
                 .await?
                 .to_string(),
         );
@@ -1040,6 +1051,24 @@ impl Context {
         res.insert(
             "force_encryption",
             self.get_config_bool(Config::ForceEncryption)
+                .await?
+                .to_string(),
+        );
+        res.insert(
+            "last_automatic_relay_management",
+            self.get_config_i64(Config::LastAutomaticRelayManagement)
+                .await?
+                .to_string(),
+        );
+        res.insert(
+            "automatic_relay_management",
+            self.get_config_bool(Config::AutomaticRelayManagement)
+                .await?
+                .to_string(),
+        );
+        res.insert(
+            "automatic_relay_management_finished",
+            self.get_config_bool(Config::AutomaticRelayManagementFinished)
                 .await?
                 .to_string(),
         );

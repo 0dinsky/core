@@ -5,7 +5,6 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, ensure};
-use deltachat_contact_tools::EmailAddress;
 use deltachat_contact_tools::addr_cmp;
 use pgp::composed::SignedPublicKey;
 use rusqlite::OptionalExtension;
@@ -15,7 +14,7 @@ use crate::configure::EnteredLoginParam;
 use crate::context::Context;
 use crate::key::DcKey;
 use crate::log::warn;
-use crate::provider::get_provider_info;
+
 use crate::sql::Sql;
 use crate::tools::{self, Time, inc_and_check, time_elapsed};
 use crate::transport::ConfiguredLoginParam;
@@ -433,7 +432,7 @@ fn migrate_key_contacts(
                 Ok(())
             };
             let old_and_new_members: Vec<(u32, bool, Option<u32>)> = match typ {
-                // 1:1 chats retain:
+                // Single chats retain:
                 // - address-contact if peerstate is in the "reset" state,
                 //   or if there is no key-contact that has the right email address.
                 // - key-contact identified by the Autocrypt key if Autocrypt key does not match the verified key.
@@ -444,7 +443,7 @@ fn migrate_key_contacts(
                     let Some((old_member, _)) = old_members.first() else {
                         info!(
                             context,
-                            "1:1 chat {chat_id} doesn't contain contact, probably it's self or device chat."
+                            "Single chat {chat_id} doesn't contain contact, probably it's self or device chat."
                         );
                         continue;
                     };
@@ -1118,22 +1117,7 @@ UPDATE chats SET protected=1, type=120 WHERE type=130;"#,
         .await?;
     }
 
-    if dbversion < 71 {
-        if let Ok(addr) = context.get_primary_self_addr().await {
-            if let Ok(domain) = EmailAddress::new(&addr).map(|email| email.domain) {
-                context
-                    .set_config_internal(
-                        Config::ConfiguredProvider,
-                        get_provider_info(&domain).map(|provider| provider.id),
-                    )
-                    .await?;
-            } else {
-                warn!(context, "Can't parse configured address: {:?}", addr);
-            }
-        }
-
-        sql.set_db_version(71).await?;
-    }
+    // Migration 71 was removed together with the provider database it read from.
     if dbversion < 72 && !sql.col_exists("msgs", "mime_modified").await? {
         sql.execute_migration(
             r#"
@@ -2390,7 +2374,7 @@ UPDATE msgs SET state=24 WHERE state=18; -- Change OutPreparing to OutFailed.
         sql.execute_migration_transaction(
             |transaction| {
                 // Newest timestamp of message sent to unencrypted chat with contacts.
-                // This is for 1:1 chats and ad hoc groups.
+                // This is for single chats and ad hoc groups.
                 //
                 // Corner case of ad hoc groups with only self as a member is ignored.
                 let max_unencrypted_timestamp: i64 = transaction.query_row(
@@ -2517,6 +2501,110 @@ UPDATE msgs SET state=24 WHERE state=18; -- Change OutPreparing to OutFailed.
                 PRIMARY KEY(rfc724_mid, contact_id),
                 FOREIGN KEY(contact_id) REFERENCES contacts(id) ON DELETE CASCADE
             ) STRICT",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 159)?;
+    if dbversion < migration_version {
+        // Core 2.56.0 stored login parameters without the `oauth2` field,
+        // but older cores require it when deserializing.
+        // Set it to false as OAuth2 is not supported anymore.
+        sql.execute_migration(
+            "UPDATE transports
+             SET entered_param=json_set(entered_param, '$.oauth2', json('false')),
+                 configured_param=json_set(configured_param, '$.oauth2', json('false'))",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 160)?;
+    if dbversion < migration_version {
+        // Tracks when own key was last attached to an MDN
+        // so it is not attached to every MDN.
+        sql.execute_migration(
+            "CREATE TABLE mdn_autocrypt_timestamp (
+                fingerprint TEXT PRIMARY KEY NOT NULL, -- Upper-case fingerprint of the recipient key.
+                attached_timestamp INTEGER NOT NULL
+            ) STRICT",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 161)?;
+    if dbversion < migration_version {
+        // TODO put a better list here
+        const DEFAULT_RELAY_CANDIDATES: &[&str] = &[
+            "mehl.cloud",
+            "mailchat.pl",
+            "chatmail.woodpeckersnest.space",
+            "chatmail.culturanerd.it",
+            "tarpit.fun",
+            "d.gaufr.es",
+        ];
+
+        sql.execute_migration_transaction(
+            |transaction| {
+                transaction.execute(
+                    "CREATE TABLE relay_candidates(
+                        host TEXT PRIMARY KEY NOT NULL,
+                        last_tried INTEGER NOT NULL DEFAULT 0
+                    ) STRICT",
+                    (),
+                )?;
+                let mut statement =
+                    transaction.prepare("INSERT INTO relay_candidates(host) VALUES (?)")?;
+                for host in DEFAULT_RELAY_CANDIDATES {
+                    statement.execute((host,))?;
+                }
+                Ok(())
+            },
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 162)?;
+    if dbversion < migration_version {
+        // `broadcasted_reactions` stores accumulated reactions for broadcast channel subscribers (Chattype::InBroadcast).
+        // `broadcasted_reactions` is unused for broadcast channel owners (Chattype::OutBroadcast),
+        // there `reactions_need_broadcast` is used to find out new reactions to be sent to subscribers.
+        sql.execute_migration(
+            "CREATE TABLE broadcasted_reactions (
+                msg_id INTEGER NOT NULL DEFAULT 0,
+                reaction TEXT NOT NULL DEFAULT '',
+                count INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(msg_id) REFERENCES msgs(id) ON DELETE CASCADE -- delete reactions when message is deleted
+            ) STRICT;
+            CREATE INDEX broadcasted_reactions_index1 ON broadcasted_reactions (msg_id);
+            CREATE TABLE reactions_need_broadcast (
+                chat_id INTEGER NOT NULL DEFAULT 0,
+                msg_id INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (chat_id, msg_id),
+                FOREIGN KEY(msg_id) REFERENCES msgs(id) ON DELETE CASCADE -- delete reactions when message is deleted
+            ) STRICT;
+            CREATE INDEX reactions_need_broadcast_index1 ON reactions_need_broadcast (chat_id);",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 163)?;
+    if dbversion < migration_version {
+        // store pinned state as a column rather than in a separate table,
+        // because pinned state must be read together with mostly every message (to show the "pin needle"),
+        // so a LEFT JOIN would add per-row overhead on every message load -
+        // even though pinned messages themselves are rare.
+        // this mirrors how "starred" and "hidden" are handled.
+        //
+        // the partial index `WHERE pinned=1` keeps the index small and useful,
+        // since the vast majority of rows are `pinned=0`.
+        sql.execute_migration(
+            "ALTER TABLE msgs ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+            CREATE INDEX msgs_index10 ON msgs (pinned) WHERE pinned=1;",
             migration_version,
         )
         .await?;

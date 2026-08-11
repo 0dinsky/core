@@ -1,3 +1,7 @@
+use std::num::NonZero;
+use std::sync::Arc;
+use std::time::Duration;
+
 use super::*;
 use crate::Event;
 use crate::chatlist::get_archived_cnt;
@@ -9,6 +13,7 @@ use crate::headerdef::HeaderDef;
 use crate::imex::{ImexMode, has_backup, imex};
 use crate::message::{Message, MessengerMessage, delete_msgs};
 use crate::mimeparser::{self, MimeMessage};
+use crate::pinned_messages::{get_pinned_messages, set_pinned_state};
 use crate::qr::{Qr, check_qr};
 use crate::receive_imf::receive_imf;
 use crate::securejoin::{get_securejoin_qr, join_securejoin};
@@ -19,7 +24,6 @@ use crate::test_utils::{
 };
 use crate::tools::SystemTime;
 use pretty_assertions::assert_eq;
-use std::time::Duration;
 use strum::IntoEnumIterator;
 use tokio::fs;
 
@@ -257,9 +261,9 @@ async fn test_quote_replies() -> Result<()> {
     let grp_msg_id = send_text_msg(&alice, grp_chat_id, "bar".to_string()).await?;
     let grp_msg = Message::load_from_db(&alice, grp_msg_id).await?;
 
-    let one2one_chat_id = alice.create_chat(&bob).await.id;
-    let one2one_msg_id = send_text_msg(&alice, one2one_chat_id, "foo".to_string()).await?;
-    let one2one_msg = Message::load_from_db(&alice, one2one_msg_id).await?;
+    let single_chat_id = alice.create_chat(&bob).await.id;
+    let single_chat_msg_id = send_text_msg(&alice, single_chat_id, "foo".to_string()).await?;
+    let single_chat_msg = Message::load_from_db(&alice, single_chat_msg_id).await?;
 
     // quoting messages in same chat is okay
     let mut msg = Message::new_text("baz".to_string());
@@ -268,25 +272,25 @@ async fn test_quote_replies() -> Result<()> {
     assert!(result.is_ok());
 
     let mut msg = Message::new_text("baz".to_string());
-    msg.set_quote(&alice, Some(&one2one_msg)).await?;
-    let result = send_msg(&alice, one2one_chat_id, &mut msg).await;
+    msg.set_quote(&alice, Some(&single_chat_msg)).await?;
+    let result = send_msg(&alice, single_chat_id, &mut msg).await;
     assert!(result.is_ok());
-    let one2one_quote_reply_msg_id = result.unwrap();
+    let single_chat_quote_reply_msg_id = result.unwrap();
 
-    // quoting messages from groups to one-to-ones is okay ("reply privately")
+    // quoting messages from groups to single chats is okay ("reply privately")
     let mut msg = Message::new_text("baz".to_string());
     msg.set_quote(&alice, Some(&grp_msg)).await?;
-    let result = send_msg(&alice, one2one_chat_id, &mut msg).await;
+    let result = send_msg(&alice, single_chat_id, &mut msg).await;
     assert!(result.is_ok());
 
-    // quoting messages from one-to-one chats in groups is an error; usually this is also not allowed by UI at all ...
+    // quoting messages from single chats in groups is an error; usually this is also not allowed by UI at all ...
     let mut msg = Message::new_text("baz".to_string());
-    msg.set_quote(&alice, Some(&one2one_msg)).await?;
+    msg.set_quote(&alice, Some(&single_chat_msg)).await?;
     let result = send_msg(&alice, grp_chat_id, &mut msg).await;
     assert!(result.is_err());
 
     // ... but forwarding messages with quotes is allowed
-    let result = forward_msgs(&alice, &[one2one_quote_reply_msg_id], grp_chat_id).await;
+    let result = forward_msgs(&alice, &[single_chat_quote_reply_msg_id], grp_chat_id).await;
     assert!(result.is_ok());
 
     // ... and bots are not restricted
@@ -306,6 +310,8 @@ async fn test_add_contact_to_chat_ex_add_self() {
         .await
         .unwrap();
     assert_eq!(added, false);
+    t.assert_warn("Invalid attempt to add self e-mail address to group")
+        .await;
 }
 
 /// Test adding and removing members in a group chat.
@@ -773,7 +779,7 @@ async fn test_leave_group() -> Result<()> {
     Ok(())
 }
 
-/// Test that adding or removing contacts in 1:1 chat is not allowed.
+/// Test that adding or removing contacts in single chat is not allowed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_add_remove_contact_for_single() {
     let ctx = TestContext::new_alice().await;
@@ -783,7 +789,7 @@ async fn test_add_remove_contact_for_single() {
     assert_eq!(chat.typ, Chattype::Single);
     assert_eq!(get_chat_contacts(&ctx, chat.id).await.unwrap().len(), 1);
 
-    // adding or removing contacts from one-to-one-chats result in an error
+    // adding or removing contacts from single chats result in an error
     let claire = Contact::create(&ctx, "", "claire@foo.de").await.unwrap();
     let added = add_contact_to_chat_ex(&ctx, Nosync, chat.id, claire, false).await;
     assert!(added.is_err());
@@ -2711,7 +2717,7 @@ async fn test_resend_doesnt_resort_msg() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
-    let alice_grp = create_group(alice, "").await?;
+    let alice_grp = create_group(alice, "group").await?;
     let sent1 = alice.send_text(alice_grp, "hi").await;
     let sent1_ts = Message::load_from_db(alice, sent1.sender_msg_id)
         .await?
@@ -2875,6 +2881,9 @@ async fn test_broadcast_members_cant_see_each_other() -> Result<()> {
         let parsed_by_bob = bob.parse_msg(&vc_pubkey).await;
         assert!(parsed_by_bob.decryption_error.is_some());
 
+        bob.assert_warn("Could not find symmetric secret for session key")
+            .await;
+
         charlie.recv_msg_trash(&vc_pubkey).await;
     }
 
@@ -2912,6 +2921,8 @@ async fn test_broadcast_members_cant_see_each_other() -> Result<()> {
 
         let parsed_by_bob = bob.parse_msg(&member_added).await;
         assert!(parsed_by_bob.decryption_error.is_some());
+        bob.assert_warn("decryption failed: decrypt_the_ring: missing key")
+            .await;
 
         let rcvd = charlie.recv_msg(&member_added).await;
         assert_eq!(rcvd.param.get_cmd(), SystemMessage::MemberAddedToGroup);
@@ -2944,6 +2955,8 @@ async fn test_broadcast_members_cant_see_each_other() -> Result<()> {
 
         let parsed_by_bob = bob.parse_msg(&member_removed).await;
         assert!(parsed_by_bob.decryption_error.is_some());
+        bob.assert_warn("decryption failed: decrypt_the_ring: missing key")
+            .await;
 
         let rcvd = charlie.recv_msg(&member_removed).await;
         assert_eq!(rcvd.param.get_cmd(), SystemMessage::MemberRemovedFromGroup);
@@ -3054,6 +3067,107 @@ async fn test_broadcast_change_name() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_broadcast_muted() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    // Alice's new outgoing broadcast channel is muted after creation:
+    // Channel owners can only get reaction notifications; they are usually not of much interest.
+    let alice_chat_id = create_broadcast(alice, "Channel".to_string()).await?;
+    let qr = get_securejoin_qr(alice, Some(alice_chat_id)).await?;
+    let alice_chat = Chat::load_from_db(alice, alice_chat_id).await?;
+    assert!(alice_chat.is_muted());
+
+    // Bob joins the channel, for him, it is not muted:
+    // For channel subscribers, new messages to newly subscribed channels are often interesting.
+    let bob_chat_id = tcm.exec_securejoin_qr(bob, alice, &qr).await;
+    bob_chat_id.accept(bob).await?;
+    let bob_chat = Chat::load_from_db(bob, bob_chat_id).await?;
+    assert!(!bob_chat.is_muted());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_broadcast_msgs_to_resend() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+
+    // Alice creates a channel
+    let alice = &tcm.alice().await;
+    let chat_id = create_broadcast(alice, "test channel".to_string()).await?;
+    assert_eq!(get_pinned_messages(alice, chat_id).await?.len(), 0);
+    let to_resend = get_broadcast_msgs_to_resend(alice, chat_id).await?;
+    assert_eq!(to_resend.len(), 0);
+
+    // Alice sends 5 messsage to the channel, all of them will be resent
+    let mut msg_ids = Vec::new(); // oldest is first
+    for i in 0..5 {
+        let msg_id = send_text_msg(alice, chat_id, format!("message {i}")).await?;
+        msg_ids.push(msg_id);
+    }
+    let to_resend = get_broadcast_msgs_to_resend(alice, chat_id).await?;
+    assert_eq!(to_resend.len(), 5);
+    for msg_id in &msg_ids[0..5] {
+        assert!(to_resend.contains(msg_id));
+    }
+
+    // If Alice has 50 messags in the channel, only the 10 newest will be resent
+    for i in 5..50 {
+        let msg_id = send_text_msg(alice, chat_id, format!("message {i}")).await?;
+        msg_ids.push(msg_id);
+    }
+    let to_resend = get_broadcast_msgs_to_resend(alice, chat_id).await?;
+    assert_eq!(to_resend.len(), N_MSGS_TO_NEW_BROADCAST_MEMBER);
+    for msg_id in &msg_ids[50 - N_MSGS_TO_NEW_BROADCAST_MEMBER..50] {
+        assert!(to_resend.contains(msg_id));
+    }
+
+    // Alice pins the 2 newest messages, they are included in the most recent ones
+    set_pinned_state(alice, msg_ids[50 - 1], true).await?;
+    set_pinned_state(alice, msg_ids[50 - 2], true).await?;
+    assert_eq!(get_pinned_messages(alice, chat_id).await?.len(), 2);
+    let to_resend = get_broadcast_msgs_to_resend(alice, chat_id).await?;
+    assert_eq!(to_resend.len(), N_MSGS_TO_NEW_BROADCAST_MEMBER);
+    assert!(to_resend.contains(&msg_ids[50 - 1]));
+    assert!(to_resend.contains(&msg_ids[50 - 2]));
+    for msg_id in &msg_ids[50 - N_MSGS_TO_NEW_BROADCAST_MEMBER..50] {
+        assert!(to_resend.contains(msg_id));
+    }
+
+    // Alice pins the 2 oldest messages, they will be resent additionally to the recent messages
+    set_pinned_state(alice, msg_ids[50 - 1], false).await?;
+    set_pinned_state(alice, msg_ids[50 - 2], false).await?;
+    set_pinned_state(alice, msg_ids[0], true).await?;
+    set_pinned_state(alice, msg_ids[1], true).await?;
+    assert_eq!(get_pinned_messages(alice, chat_id).await?.len(), 2);
+    let to_resend = get_broadcast_msgs_to_resend(alice, chat_id).await?;
+    assert_eq!(to_resend.len(), N_MSGS_TO_NEW_BROADCAST_MEMBER + 2);
+    assert!(to_resend.contains(&msg_ids[0]));
+    assert!(to_resend.contains(&msg_ids[1]));
+    for msg_id in &msg_ids[50 - N_MSGS_TO_NEW_BROADCAST_MEMBER..50] {
+        assert!(to_resend.contains(msg_id));
+    }
+
+    // If alice pins 23 old messages, only 10 recently pinned gets resend.
+    // plus 10 normal ones.
+    for msg_id in &msg_ids[0..23] {
+        set_pinned_state(alice, *msg_id, true).await?;
+    }
+    assert_eq!(get_pinned_messages(alice, chat_id).await?.len(), 23);
+    let to_resend = get_broadcast_msgs_to_resend(alice, chat_id).await?;
+    assert_eq!(to_resend.len(), N_MSGS_TO_NEW_BROADCAST_MEMBER * 2);
+    for msg_id in &msg_ids[23 - N_MSGS_TO_NEW_BROADCAST_MEMBER..23] {
+        assert!(to_resend.contains(msg_id));
+    }
+    for msg_id in &msg_ids[50 - N_MSGS_TO_NEW_BROADCAST_MEMBER..50] {
+        assert!(to_resend.contains(msg_id));
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_broadcast_resend_to_new_member() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
@@ -3096,6 +3210,9 @@ async fn test_broadcast_resend_to_new_member() -> Result<()> {
                 .is_some()
         );
         bob.recv_msg_trash(&resent_msg).await;
+        bob.assert_warn("missing key").await;
+        bob.assert_warn("missing key").await;
+        bob.assert_warn("unencrypted message").await;
     }
     assert!(alice.pop_sent_msg_opt().await.is_none());
     Ok(())
@@ -3114,6 +3231,7 @@ async fn test_broadcast_resend_failed_msg_to_new_member() -> Result<()> {
     let alice_msg_id = alice.send_text(alice_bc_id, "text").await.sender_msg_id;
     let mut msg = Message::load_from_db(alice, alice_msg_id).await?;
     message::set_msg_failed(alice, &mut msg, "error").await?;
+    alice.assert_warn("error").await;
     let fiona_bc_id = tcm.exec_securejoin_qr(fiona, alice, &qr).await;
     let resent_msg = alice.pop_sent_msg().await;
     let fiona_msg = fiona.recv_msg(&resent_msg).await;
@@ -3205,6 +3323,7 @@ async fn test_broadcast_recipients_sync1() -> Result<()> {
     sync(alice1, alice2).await;
     let a2_chatlist = Chatlist::try_load(alice2, 0, Some("Channel"), None).await?;
     assert!(a2_chatlist.is_empty());
+    alice2.assert_warn("No chat for grpid").await;
 
     // Alice1 adds Charlie to the broadcast channel,
     // and now, Alice2 receives the messages
@@ -3220,6 +3339,7 @@ async fn test_broadcast_recipients_sync1() -> Result<()> {
     let request_with_auth = charlie.pop_sent_msg().await;
     alice1.recv_msg_trash(&request_with_auth).await;
     alice2.recv_msg_trash(&request_with_auth).await;
+    alice2.assert_warn("unknown grpid").await;
 
     let member_added = alice1.pop_sent_msg().await;
     let a2_charlie_added = alice2.recv_msg(&member_added).await;
@@ -3546,6 +3666,7 @@ async fn test_chat_description(
 
         tcm.section("Check Alice's second device");
         alice2.recv_msg(&sent).await;
+
         let alice2_chat_id = get_chat_id_by_grpid(
             alice2,
             &Chat::load_from_db(alice, alice_chat_id).await?.grpid,
@@ -3622,7 +3743,7 @@ async fn test_broadcast_joining_golden() -> Result<()> {
         .await;
 
     let alice_bob_contact = alice.add_or_lookup_contact_no_key(bob).await;
-    // The 1:1 chat with Bob should not be visible to the user:
+    // The single chat with Bob should not be visible to the user:
     assert!(
         ChatIdBlocked::lookup_by_contact(alice, alice_bob_contact.id)
             .await?
@@ -3932,14 +4053,16 @@ async fn test_leave_broadcast_multidevice() -> Result<()> {
 
     tcm.section("Bob's second device also receives these messages");
     bob1.recv_msg_trash(&vc_pubkey).await;
+    bob1.assert_warn("decryption failed").await;
+    bob1.assert_warn("unencrypted message").await;
     bob1.recv_msg_trash(&request_with_auth).await;
     bob1.recv_msg(&member_added).await;
 
-    // The 1:1 chat should not be visible to the user on any of the devices.
+    // The single chat should not be visible to the user on any of the devices.
     // The contact should be marked as verified.
-    check_direct_chat_is_hidden_and_contact_is_verified(alice, bob0).await;
-    check_direct_chat_is_hidden_and_contact_is_verified(bob0, alice).await;
-    check_direct_chat_is_hidden_and_contact_is_verified(bob1, alice).await;
+    check_single_chat_is_hidden_and_contact_is_verified(alice, bob0).await;
+    check_single_chat_is_hidden_and_contact_is_verified(bob0, alice).await;
+    check_single_chat_is_hidden_and_contact_is_verified(bob1, alice).await;
 
     tcm.section("Alice sends first message to broadcast.");
     let sent_msg = alice.send_text(alice_chat_id, "Hello!").await;
@@ -3954,7 +4077,7 @@ async fn test_leave_broadcast_multidevice() -> Result<()> {
 
     let leave_msg = bob0.pop_sent_msg().await;
     let parsed = MimeMessage::from_bytes(bob1, leave_msg.payload().as_bytes()).await?;
-    assert_eq!(parsed.parts[0].msg, "bob@example.net left the group.");
+    assert_eq!(parsed.parts[0].msg, "Member bob@example.net was removed.");
 
     let rcvd = bob1.recv_msg(&leave_msg).await;
 
@@ -3966,16 +4089,16 @@ async fn test_leave_broadcast_multidevice() -> Result<()> {
     Ok(())
 }
 
-async fn check_direct_chat_is_hidden_and_contact_is_verified(
+async fn check_single_chat_is_hidden_and_contact_is_verified(
     t: &TestContext,
     contact: &TestContext,
 ) {
     let contact = t.add_or_lookup_contact_no_key(contact).await;
-    if let Some(direct_chat) = ChatIdBlocked::lookup_by_contact(t, contact.id)
+    if let Some(single_chat) = ChatIdBlocked::lookup_by_contact(t, contact.id)
         .await
         .unwrap()
     {
-        assert_eq!(direct_chat.blocked, Blocked::Yes);
+        assert_eq!(single_chat.blocked, Blocked::Yes);
     }
     assert!(contact.is_verified(t).await.unwrap());
 }
@@ -4018,9 +4141,10 @@ async fn test_only_broadcast_owner_can_send_1() -> Result<()> {
         .await?;
 
     tcm.section(
-        "Bob receives an answer, but shows it in 1:1 chat because of a fingerprint mismatch",
+        "Bob receives an answer, but shows it in a single chat because of a fingerprint mismatch",
     );
     let rcvd = bob.recv_msg(&member_added).await;
+    bob.assert_warn("wrong sender").await;
     assert_eq!(rcvd.text, "Member bob@example.net was added.");
 
     let bob_alice_chat_id = bob.get_chat(alice).await.id;
@@ -4072,18 +4196,21 @@ async fn test_only_broadcast_owner_can_send_2() -> Result<()> {
 
     alice.sql.execute("DELETE FROM keypairs", ()).await?;
     *alice.self_public_key.lock().await = None;
-    // Invalidate cached self fingerprint too — now a Mutex (like self_public_key
-    // above) so key rotation can clear it too, without needing exclusive
-    // (`Arc::get_mut`) access as a plain OnceLock would have required.
-    *alice.self_fingerprint.lock().await = None;
     alice
         .sql
         .execute("DELETE FROM config WHERE keyname='key_id'", ())
         .await?;
+    // Invalidate cached self fingerprint:
+    Arc::get_mut(&mut alice.ctx.inner)
+        .unwrap()
+        .self_fingerprint
+        .take();
 
     tcm.section("Alice sends a message, which is trashed");
     let sent = alice.send_text(alice_broadcast_id, "Hi").await;
     bob.recv_msg_trash(&sent).await;
+    bob.assert_warn("This sender is not allowed to encrypt with this secret key")
+        .await;
     let EventType::Warning(warning) = bob
         .evtracker
         .get_matching(|ev| matches!(ev, EventType::Warning(_)))
@@ -4197,6 +4324,10 @@ async fn test_encrypt_decrypt_broadcast() -> Result<()> {
 
     tcm.section("If Bob doesn't know the secret, he can't decrypt the message");
     bob_without_secret.recv_msg_trash(&sent).await;
+    bob_without_secret
+        .assert_warn("Could not find symmetric secret for session key")
+        .await;
+    bob_without_secret.assert_warn("unencrypted message").await;
 
     Ok(())
 }
@@ -4312,7 +4443,9 @@ async fn test_out_failed_on_all_keys_missing() -> Result<()> {
     let bob = &tcm.bob().await;
     let fiona = &tcm.fiona().await;
 
-    let bob_chat_id = bob.create_group_with_members("", &[alice, fiona]).await;
+    let bob_chat_id = bob
+        .create_group_with_members("group", &[alice, fiona])
+        .await;
     bob.send_text(bob_chat_id, "Gossiping Fiona's key").await;
     alice
         .recv_msg(&bob.send_text(bob_chat_id, "No key gossip").await)
@@ -4324,6 +4457,8 @@ async fn test_out_failed_on_all_keys_missing() -> Result<()> {
     let mut msg = Message::new_text("Hi".to_string());
     send_msg(alice, alice_chat_id, &mut msg).await.ok();
     assert_eq!(msg.id.get_state(alice).await?, MessageState::OutFailed);
+    alice.assert_warn("Missing key").await;
+    alice.assert_warn("cannot encrypt").await;
     Ok(())
 }
 
@@ -4604,7 +4739,7 @@ async fn test_sync_blocked() -> Result<()> {
     sync(alice0, alice1).await;
     assert_eq!(alice1.get_chat(bob).await.blocked, Blocked::Not);
 
-    // Unblocking a 1:1 chat doesn't unblock the contact currently.
+    // Unblocking a single chat doesn't unblock the contact currently.
     Contact::unblock(alice0, a0b_contact_id).await?;
 
     assert!(!alice1.add_or_lookup_contact(bob).await.is_blocked());
@@ -4944,6 +5079,9 @@ async fn test_sync_broadcast_and_send_message() -> Result<()> {
     let bob_broadcast_id = tcm
         .exec_securejoin_qr_multi_device(bob, &[alice1, alice2], &qr)
         .await;
+    bob.assert_warn("Could not find symmetric secret for session key")
+        .await;
+    bob.assert_warn("unencrypted message").await;
 
     let a2b_contact_id = alice2.add_or_lookup_contact_no_key(bob).await.id;
     assert_eq!(
@@ -5115,7 +5253,7 @@ async fn test_blocked_bob_cant_join_chat() -> Result<()> {
     let alice2_bob_id = alice2.add_or_lookup_contact_id(bob).await;
     Contact::block(alice2, alice2_bob_id).await?;
 
-    let alice1_chat_id = create_group(alice1, "").await?;
+    let alice1_chat_id = create_group(alice1, "group").await?;
     sync(alice1, alice2).await;
     let alice1_chat = Chat::load_from_db(alice1, alice1_chat_id).await?;
     let (alice2_chat_id, _blocked) = get_chat_id_by_grpid(alice2, &alice1_chat.grpid)
@@ -5126,6 +5264,8 @@ async fn test_blocked_bob_cant_join_chat() -> Result<()> {
 
     tcm.exec_securejoin_qr_multi_device(bob, &[alice1, alice2], &qr)
         .await;
+    alice2.assert_warn("blocked").await;
+    alice2.assert_warn("blocked").await;
     let alice1_bob_id = alice1.add_or_lookup_contact_id(bob).await;
     assert_eq!(get_chat_contacts(alice1, alice1_chat_id).await?.len(), 2);
     // "vg-member-added" from alice1 adds bob for alice2 to provide membership consistency on
@@ -5140,6 +5280,7 @@ async fn test_blocked_bob_cant_join_chat() -> Result<()> {
     remove_contact_from_chat(alice1, alice1_chat_id, alice1_bob_id).await?;
     bob.recv_msg(&alice1.pop_sent_msg().await).await;
     tcm.exec_securejoin_qr(bob, alice1, &qr).await;
+    alice1.assert_warn("blocked").await;
     let members = get_chat_contacts(alice1, alice1_chat_id).await?;
     assert_eq!(members.len(), 1);
     assert!(members.contains(&ContactId::SELF));
@@ -5150,7 +5291,7 @@ async fn test_blocked_bob_cant_join_chat() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_blocked_bob_cant_create_11_chat_via_securejoin() -> Result<()> {
+async fn test_blocked_bob_cant_create_single_chat_via_securejoin() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice1 = &tcm.alice().await;
     let alice2 = &tcm.alice().await;
@@ -5170,6 +5311,9 @@ async fn test_blocked_bob_cant_create_11_chat_via_securejoin() -> Result<()> {
     assert_eq!(get_chat_cnt(alice2).await?, chat_cnt);
     tcm.exec_securejoin_qr_multi_device(bob, &[alice1, alice2], &qr)
         .await;
+    for _ in 0..3 {
+        alice2.assert_warn("blocked").await;
+    }
     assert_eq!(get_chat_cnt(alice1).await?, chat_cnt + 1);
     assert_eq!(get_chat_cnt(alice2).await?, chat_cnt);
     Ok(())
@@ -5265,6 +5409,7 @@ async fn test_nonimage_with_png_ext() -> Result<()> {
             msg.get_filename().unwrap().contains("screenshot"),
             vt == Viewtype::File
         );
+        alice.assert_error("Unknown format").await;
         let msg_bob = bob.recv_msg(&sent_msg).await;
         assert_eq!(msg_bob.viewtype, Viewtype::File);
         assert_eq!(msg_bob.get_filemime().unwrap(), "application/octet-stream");
@@ -5414,7 +5559,12 @@ async fn test_info_contact_id() -> Result<()> {
     .await?;
 
     alice_chat_id
-        .set_ephemeral_timer(alice, Timer::Enabled { duration: 60 })
+        .set_ephemeral_timer(
+            alice,
+            Timer::Enabled {
+                duration: NonZero::new(60).unwrap(),
+            },
+        )
         .await?;
     pop_recv_and_check(
         alice,
@@ -5583,6 +5733,7 @@ async fn test_non_member_cannot_modify_member_list() -> Result<()> {
     remove_contact_from_chat(bob, bob_chat_id, bob_alice_contact_id).await?;
     let bob_sent_add_msg = bob.pop_sent_msg().await;
     alice.recv_msg_trash(&bob_sent_add_msg).await;
+    alice.assert_warn("no contact id").await;
     assert_eq!(get_chat_contacts(alice, alice_chat_id).await?.len(), 1);
     Ok(())
 }
@@ -5831,7 +5982,7 @@ async fn test_restore_backup_after_60_days() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_one_to_one_chat_no_group_member_timestamps() {
+async fn test_single_chat_no_group_member_timestamps() {
     let t = TestContext::new_alice().await;
     t.allow_unencrypted().await.unwrap();
     let chat = t.create_chat_with_contact("bob", "bob@example.com").await;
@@ -5959,6 +6110,8 @@ async fn test_receive_edit_request_after_removal() -> Result<()> {
 
     bob.recv_msg_trash(&sent2).await;
     assert_eq!(bob_chat_id.get_msg_cnt(bob).await?, E2EE_INFO_MSGS);
+    bob.assert_warn("Edit message: Database entry does not exist")
+        .await;
 
     Ok(())
 }
@@ -6052,6 +6205,7 @@ async fn test_send_delete_request() -> Result<()> {
     let bob2 = &tcm.bob().await;
     bob2.recv_msg_opt(&sent2).await;
     assert!(bob2.recv_msg_opt(&sent1).await.is_none());
+    bob2.assert_warn("not found").await;
 
     // Alice has another device, and there is also nothing at the end
     let alice2 = &tcm.alice().await;
@@ -6222,9 +6376,9 @@ async fn test_forward_msgs_2ctx_missing_blob() -> Result<()> {
 
 /// Tests that in multi-device setup
 /// second device learns the key of a contact
-/// via Autocrypt-Gossip in 1:1 chats.
+/// via Autocrypt-Gossip in single chats.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_oneone_gossip() -> Result<()> {
+async fn test_single_gossip() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
     let alice2 = &tcm.alice().await;
@@ -6343,6 +6497,9 @@ async fn test_create_unencrypted_group_chat() -> Result<()> {
     assert!(res.is_err());
 
     add_contact_to_chat(alice, chat_id, charlie_address_contact_id).await?;
+    alice
+        .assert_warn("No good message identifying the chat found")
+        .await;
 
     let chat = Chat::load_from_db(alice, chat_id).await?;
     assert!(!chat.is_encrypted(alice).await?);
@@ -6359,6 +6516,7 @@ async fn test_create_group_invalid_name() -> Result<()> {
     let chat_id = create_group(alice, " ").await?;
     let chat = Chat::load_from_db(alice, chat_id).await?;
     assert_eq!(chat.get_name(), "…");
+    alice.assert_error("Invalid chat name").await;
     Ok(())
 }
 
@@ -6382,6 +6540,7 @@ async fn test_no_avatar_in_adhoc_chats() -> Result<()> {
     .await?
     .unwrap()
     .chat_id;
+    alice.assert_warn("unencrypted message").await;
 
     // Test that setting avatar in ad hoc group is not possible.
     let file = alice.dir.path().join("avatar.png");
@@ -6570,6 +6729,37 @@ async fn test_unpromoted_group_start_message() -> Result<()> {
     assert_eq!(e2ee_msg_id2, e2ee_msg_id);
     assert_eq!(info_msg_id2, info_msg_id);
     assert_eq!(text_msg_id2, text_msg_id);
+
+    Ok(())
+}
+
+/// Tests that outer To header is ignored for broadcast messages.
+///
+/// Broadcast messages have no recipients in the To field,
+/// but this does not mean that outer To field should be used.
+///
+/// With RFC 9788 header protection all outer headers should be ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_broadcast_message_replaced_to() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    let alice_broadcast_id = create_broadcast(alice, "Channel".to_string()).await?;
+    let qr = get_securejoin_qr(alice, Some(alice_broadcast_id))
+        .await
+        .unwrap();
+    let bob_chat_id = tcm.exec_securejoin_qr(bob, alice, &qr).await;
+
+    let mut sent = alice.send_text(alice_broadcast_id, "Hello!").await;
+    sent.payload = sent
+        .payload
+        .replace("To: ", "To: mallory@example.org\r\nX-Foobar: ");
+    let bob_msg = bob.recv_msg(&sent).await;
+
+    // The message should be assigned to the broadcast chat
+    // and not to some ad hoc group with mallory@example.org
+    assert_eq!(bob_msg.chat_id, bob_chat_id);
 
     Ok(())
 }

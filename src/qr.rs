@@ -9,10 +9,9 @@ pub use dclogin_scheme::LoginOptions;
 pub(crate) use dclogin_scheme::login_param_from_login_qr;
 use deltachat_contact_tools::{ContactAddress, addr_normalize, may_be_valid_addr};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, percent_encode};
-use rand::TryRngCore as _;
-use rand::distr::{Alphanumeric, SampleString};
 use serde::Deserialize;
 
+use crate::automatic_relay_management::login_param_from_host;
 use crate::chat::ADMIN_GROUP_ID_SEPARATOR;
 use crate::config::Config;
 use crate::contact::{Contact, ContactId, Origin};
@@ -840,20 +839,7 @@ pub(crate) async fn login_param_from_account_qr(
         .context("Invalid DCACCOUNT scheme")?;
 
     if !payload.starts_with(HTTPS_SCHEME) {
-        let rng = &mut rand::rngs::OsRng.unwrap_err();
-        let username = Alphanumeric.sample_string(rng, 9);
-        let addr = username + "@" + payload;
-        let password = Alphanumeric.sample_string(rng, 50);
-
-        let param = EnteredLoginParam {
-            addr,
-            imap: EnteredImapLoginParam {
-                password,
-                ..Default::default()
-            },
-            smtp: Default::default(),
-            certificate_checks: EnteredCertificateChecks::Strict,
-        };
+        let param = login_param_from_host(payload);
         return Ok(param);
     }
 
@@ -872,6 +858,7 @@ pub(crate) async fn login_param_from_account_qr(
             },
             smtp: Default::default(),
             certificate_checks: EnteredCertificateChecks::Strict,
+            oauth2: false,
         };
 
         Ok(param)

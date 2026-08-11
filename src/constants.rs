@@ -99,7 +99,7 @@ pub const DC_CHAT_ID_LAST_SPECIAL: ChatId = ChatId::new(9);
 )]
 #[repr(u32)]
 pub enum Chattype {
-    /// A 1:1 chat, i.e. a normal chat with a single contact.
+    /// A single chat (a chat with a single contact).
     ///
     /// Created by [`ChatId::create_for_contact`].
     Single = 100,
@@ -180,13 +180,10 @@ pub const WORSE_IMAGE_SIZE: u32 = 640;
 /// usage by UIs.
 pub const MAX_RCVD_IMAGE_PIXELS: u32 = 50_000_000;
 
-// If more recipients are needed in SMTP's `RCPT TO:` header, the recipient list is split into
-// chunks. This does not affect MIME's `To:` header. Can be overwritten by setting
-// `max_smtp_rcpt_to` in the provider db.
-pub(crate) const DEFAULT_MAX_SMTP_RCPT_TO: usize = 50;
-
-/// Same as `DEFAULT_MAX_SMTP_RCPT_TO`, but for chatmail relays.
-pub(crate) const DEFAULT_CHATMAIL_MAX_SMTP_RCPT_TO: usize = 999;
+// Fallback for the maximum number of recipients in SMTP's `RCPT TO:`;
+// recipient lists exceeding the limit are sent in chunks.
+// Relays typically advertise their limit via IMAP METADATA.
+pub(crate) const DEFAULT_MAX_SMTP_RCPT_TO: u32 = 50;
 
 /// How far the last quota check needs to be in the past to be checked by the background function (in seconds).
 pub(crate) const DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT: u64 = 12 * 60 * 60; // 12 hours
@@ -214,7 +211,8 @@ Here is what to do:
 
 If you have any questions, please send an email to delta@merlinux.eu or ask at https://support.delta.chat/."#;
 
-/// How many recent messages should be re-sent to a new broadcast member.
+/// Number of recent messages that should be resent to a new broadcast member.
+/// Additionally, up to this amount of pinned messages will be resent.
 pub(crate) const N_MSGS_TO_NEW_BROADCAST_MEMBER: usize = 10;
 
 #[cfg(test)]

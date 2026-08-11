@@ -421,6 +421,15 @@ https://delta.chat/donate"))]
 
     #[strum(props(fallback = "Messages are end-to-end encrypted."))]
     MessagesAreE2ee = 242,
+
+    #[strum(props(fallback = "You pinned a message."))]
+    MsgYouPinnedAMessage = 243,
+
+    #[strum(props(fallback = "Message pinned by %1$s."))]
+    MsgMessagePinnedBy = 244,
+
+    #[strum(props(fallback = "Phasing out"))]
+    PhasingOut = 245,
 }
 
 impl StockMessage {
@@ -602,6 +611,17 @@ pub(crate) async fn msg_chat_description_changed(
         translated(context, StockMessage::MsgYouChangedDescription)
     } else {
         translated(context, StockMessage::MsgChatDescriptionChangedBy)
+            .replace1(&by_contact.get_stock_name(context).await)
+    }
+}
+
+/// Stock strings for pinning a message; used in info messages, once tapped, UI scrolled to the pinned message.
+/// For unpinning a message, we do not add a visible info message as this is of fewer interest.
+pub(crate) async fn msg_pinned(context: &Context, by_contact: ContactId) -> String {
+    if by_contact == ContactId::SELF {
+        translated(context, StockMessage::MsgYouPinnedAMessage)
+    } else {
+        translated(context, StockMessage::MsgMessagePinnedBy)
             .replace1(&by_contact.get_stock_name(context).await)
     }
 }
@@ -1126,6 +1146,11 @@ pub(crate) fn sending(context: &Context) -> String {
 /// Stock string: `Your last message was sent successfully.`.
 pub(crate) fn last_msg_sent_successfully(context: &Context) -> String {
     translated(context, StockMessage::LastMsgSentSuccessfully)
+}
+
+/// Stock string: `Phasing out`.
+pub(crate) fn phasing_out(context: &Context) -> String {
+    translated(context, StockMessage::PhasingOut)
 }
 
 /// Stock string: `Error: %1$s…`.

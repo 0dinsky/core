@@ -9,20 +9,19 @@
 //! and configured list of connection candidates.
 
 use std::fmt;
-use std::pin::Pin;
+use std::sync::atomic::Ordering;
 
 use anyhow::{Context as _, Result, bail, format_err};
 use deltachat_contact_tools::{EmailAddress, addr_normalize};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::configure::server_params::{ServerParams, expand_param_vector};
 use crate::context::Context;
 use crate::ensure_and_debug_assert;
 use crate::events::EventType;
 use crate::login_param::EnteredLoginParam;
 use crate::net::load_connection_timestamp;
-use crate::provider::{Protocol, Provider, Socket, UsernamePattern, get_provider_by_id};
+use crate::provider::Socket;
 use crate::sql::Sql;
 use crate::sync::{RemovedTransportData, SyncData, TransportData};
 
@@ -31,7 +30,7 @@ pub(crate) enum ConnectionSecurity {
     /// Implicit TLS.
     Tls,
 
-    // STARTTLS.
+    /// STARTTLS.
     Starttls,
 
     /// Plaintext.
@@ -69,9 +68,7 @@ impl TryFrom<Socket> for ConnectionSecurity {
 #[repr(u32)]
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum ConfiguredCertificateChecks {
-    /// Use configuration from the provider database.
-    /// If there is no provider database setting for certificate checks,
-    /// accept invalid certificates.
+    /// Accept invalid certificates.
     ///
     /// Must not be saved by new versions.
     ///
@@ -95,9 +92,8 @@ pub(crate) enum ConfiguredCertificateChecks {
     /// Alias to `AcceptInvalidCertificates` for compatibility.
     AcceptInvalidCertificates2 = 3,
 
-    /// Use configuration from the provider database.
-    /// If there is no provider database setting for certificate checks,
-    /// apply strict checks to TLS certificates.
+    /// Apply strict checks to TLS certificates,
+    /// unless a legacy-domain override disables them.
     Automatic = 4,
 }
 
@@ -170,8 +166,7 @@ pub(crate) struct ConfiguredLoginParam {
 
     /// Custom IMAP user.
     ///
-    /// This overwrites autoconfig from the provider database
-    /// if non-empty.
+    /// This overwrites autoconfig if non-empty.
     pub imap_user: String,
 
     pub imap_password: String,
@@ -187,13 +182,10 @@ pub(crate) struct ConfiguredLoginParam {
 
     /// Custom SMTP user.
     ///
-    /// This overwrites autoconfig from the provider database
-    /// if non-empty.
+    /// This overwrites autoconfig if non-empty.
     pub smtp_user: String,
 
     pub smtp_password: String,
-
-    pub provider: Option<&'static Provider>,
 
     /// TLS options: whether to allow invalid certificates and/or
     /// invalid hostnames
@@ -218,16 +210,16 @@ pub(crate) struct ConfiguredLoginParamJson {
     pub smtp: Vec<ConfiguredServerLoginParam>,
     pub smtp_user: String,
     pub smtp_password: String,
-    pub provider_id: Option<String>,
+
     pub certificate_checks: ConfiguredCertificateChecks,
+
+    /// Deprecated 2026-07, always false
+    #[serde(default)]
+    pub oauth2: bool,
 }
 
 impl fmt::Display for ConfiguredLoginParam {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let provider_id = match self.provider {
-            Some(provider) => provider.id,
-            None => "none",
-        };
         let certificate_checks = self.certificate_checks;
         if let Ok(parsed_addr) = EmailAddress::new(&self.addr) {
             // Only include the domain.
@@ -260,7 +252,7 @@ impl fmt::Display for ConfiguredLoginParam {
             write!(f, "{smtp}")?;
             first = false;
         }
-        write!(f, "] provider:{provider_id} cert_{certificate_checks}")?;
+        write!(f, "] cert_{certificate_checks}")?;
         Ok(())
     }
 }
@@ -297,16 +289,21 @@ impl ConfiguredLoginParam {
     /// Loads configured login parameters for all transports.
     ///
     /// Returns a vector of all transport IDs
-    /// paired with the configured parameters for the transports.
-    pub(crate) async fn load_all(context: &Context) -> Result<Vec<(u32, Self)>> {
+    /// paired with the configured parameters for the transports and the published state.
+    pub(crate) async fn load_all(context: &Context) -> Result<Vec<(u32, Self, bool)>> {
         context
             .sql
-            .query_map_vec("SELECT id, configured_param FROM transports", (), |row| {
-                let id: u32 = row.get(0)?;
-                let json: String = row.get(1)?;
-                let param = Self::from_json(&json)?;
-                Ok((id, param))
-            })
+            .query_map_vec(
+                "SELECT id, configured_param, is_published FROM transports",
+                (),
+                |row| {
+                    let id: u32 = row.get(0)?;
+                    let json: String = row.get(1)?;
+                    let param = Self::from_json(&json)?;
+                    let is_published: bool = row.get(2)?;
+                    Ok((id, param, is_published))
+                },
+            )
             .await
     }
 
@@ -344,12 +341,6 @@ impl ConfiguredLoginParam {
             .get_config(Config::ConfiguredMailPw)
             .await?
             .context("IMAP password is not configured")?;
-
-        let provider = context
-            .get_config(Config::ConfiguredProvider)
-            .await?
-            .and_then(|cfg| get_provider_by_id(&cfg));
-
         let imap;
         let smtp;
 
@@ -362,149 +353,7 @@ impl ConfiguredLoginParam {
             .await?
             .unwrap_or_default();
 
-        if let Some(provider) = provider {
-            let parsed_addr = EmailAddress::new(&addr).context("Bad email-address")?;
-            let addr_localpart = parsed_addr.local;
-
-            if provider.server.is_empty() {
-                let servers = vec![
-                    ServerParams {
-                        protocol: Protocol::Imap,
-                        hostname: context
-                            .get_config(Config::ConfiguredMailServer)
-                            .await?
-                            .unwrap_or_default(),
-                        port: context
-                            .get_config_parsed::<u16>(Config::ConfiguredMailPort)
-                            .await?
-                            .unwrap_or_default(),
-                        socket: context
-                            .get_config_parsed::<i32>(Config::ConfiguredMailSecurity)
-                            .await?
-                            .and_then(num_traits::FromPrimitive::from_i32)
-                            .unwrap_or_default(),
-                        username: mail_user.clone(),
-                    },
-                    ServerParams {
-                        protocol: Protocol::Smtp,
-                        hostname: context
-                            .get_config(Config::ConfiguredSendServer)
-                            .await?
-                            .unwrap_or_default(),
-                        port: context
-                            .get_config_parsed::<u16>(Config::ConfiguredSendPort)
-                            .await?
-                            .unwrap_or_default(),
-                        socket: context
-                            .get_config_parsed::<i32>(Config::ConfiguredSendSecurity)
-                            .await?
-                            .and_then(num_traits::FromPrimitive::from_i32)
-                            .unwrap_or_default(),
-                        username: send_user.clone(),
-                    },
-                ];
-                let servers = expand_param_vector(servers, &addr, &parsed_addr.domain);
-                imap = servers
-                    .iter()
-                    .filter_map(|params| {
-                        let Ok(security) = params.socket.try_into() else {
-                            return None;
-                        };
-                        if params.protocol == Protocol::Imap {
-                            Some(ConfiguredServerLoginParam {
-                                connection: ConnectionCandidate {
-                                    host: params.hostname.clone(),
-                                    port: params.port,
-                                    security,
-                                },
-                                user: params.username.clone(),
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                smtp = servers
-                    .iter()
-                    .filter_map(|params| {
-                        let Ok(security) = params.socket.try_into() else {
-                            return None;
-                        };
-                        if params.protocol == Protocol::Smtp {
-                            Some(ConfiguredServerLoginParam {
-                                connection: ConnectionCandidate {
-                                    host: params.hostname.clone(),
-                                    port: params.port,
-                                    security,
-                                },
-                                user: params.username.clone(),
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-            } else {
-                imap = provider
-                    .server
-                    .iter()
-                    .filter_map(|server| {
-                        if server.protocol != Protocol::Imap {
-                            return None;
-                        }
-
-                        let Ok(security) = server.socket.try_into() else {
-                            return None;
-                        };
-
-                        Some(ConfiguredServerLoginParam {
-                            connection: ConnectionCandidate {
-                                host: server.hostname.to_string(),
-                                port: server.port,
-                                security,
-                            },
-                            user: if !mail_user.is_empty() {
-                                mail_user.clone()
-                            } else {
-                                match server.username_pattern {
-                                    UsernamePattern::Email => addr.to_string(),
-                                    UsernamePattern::Emaillocalpart => addr_localpart.clone(),
-                                }
-                            },
-                        })
-                    })
-                    .collect();
-                smtp = provider
-                    .server
-                    .iter()
-                    .filter_map(|server| {
-                        if server.protocol != Protocol::Smtp {
-                            return None;
-                        }
-
-                        let Ok(security) = server.socket.try_into() else {
-                            return None;
-                        };
-
-                        Some(ConfiguredServerLoginParam {
-                            connection: ConnectionCandidate {
-                                host: server.hostname.to_string(),
-                                port: server.port,
-                                security,
-                            },
-                            user: if !send_user.is_empty() {
-                                send_user.clone()
-                            } else {
-                                match server.username_pattern {
-                                    UsernamePattern::Email => addr.to_string(),
-                                    UsernamePattern::Emaillocalpart => addr_localpart.clone(),
-                                }
-                            },
-                        })
-                    })
-                    .collect();
-            }
-        } else if let (Some(configured_mail_servers), Some(configured_send_servers)) = (
+        if let (Some(configured_mail_servers), Some(configured_send_servers)) = (
             context.get_config(Config::ConfiguredImapServers).await?,
             context.get_config(Config::ConfiguredSmtpServers).await?,
         ) {
@@ -571,7 +420,6 @@ impl ConfiguredLoginParam {
             smtp_user: send_user,
             smtp_password: send_pw,
             certificate_checks,
-            provider,
         }))
     }
 
@@ -602,7 +450,6 @@ impl ConfiguredLoginParam {
                 .is_none_or(|folder| !folder.is_empty()),
             "Configured watched folder name cannot be empty"
         );
-        let provider = json.provider_id.and_then(|id| get_provider_by_id(&id));
 
         Ok(ConfiguredLoginParam {
             addr: json.addr,
@@ -613,7 +460,7 @@ impl ConfiguredLoginParam {
             smtp: json.smtp,
             smtp_user: json.smtp_user,
             smtp_password: json.smtp_password,
-            provider,
+
             certificate_checks: json.certificate_checks,
         })
     }
@@ -623,17 +470,17 @@ impl ConfiguredLoginParam {
         Ok(serde_json::to_string(&json)?)
     }
 
-    pub(crate) fn strict_tls(&self, connected_through_proxy: bool) -> bool {
-        let provider_strict_tls = self.provider.map(|provider| provider.opt.strict_tls);
-        match self.certificate_checks {
-            ConfiguredCertificateChecks::OldAutomatic => {
-                provider_strict_tls.unwrap_or(connected_through_proxy)
-            }
-            ConfiguredCertificateChecks::Automatic => provider_strict_tls.unwrap_or(true),
+    pub(crate) fn strict_tls(&self, connected_through_proxy: bool) -> Result<bool> {
+        let disable_strict_tls =
+            crate::provider::legacy_settings_for_addr(&self.addr)?.disable_strict_tls;
+        Ok(match self.certificate_checks {
+            ConfiguredCertificateChecks::OldAutomatic if disable_strict_tls => false,
+            ConfiguredCertificateChecks::OldAutomatic => connected_through_proxy,
+            ConfiguredCertificateChecks::Automatic => !disable_strict_tls,
             ConfiguredCertificateChecks::Strict => true,
             ConfiguredCertificateChecks::AcceptInvalidCertificates
             | ConfiguredCertificateChecks::AcceptInvalidCertificates2 => false,
-        }
+        })
     }
 }
 
@@ -648,8 +495,9 @@ impl From<ConfiguredLoginParam> for ConfiguredLoginParamJson {
             smtp: configured_login_param.smtp,
             smtp_user: configured_login_param.smtp_user,
             smtp_password: configured_login_param.smtp_password,
-            provider_id: configured_login_param.provider.map(|p| p.id.to_string()),
+
             certificate_checks: configured_login_param.certificate_checks,
+            oauth2: false,
         }
     }
 }
@@ -788,20 +636,16 @@ pub(crate) async fn sync_transports(
         modified |= save_transport(context, entered, configured, *timestamp, *is_published).await?;
     }
 
-    context
+    let reelected = context
         .sql
         .transaction(|transaction| {
-            let configured_addr = transaction.query_row(
-                "SELECT value FROM config WHERE keyname='configured_addr'",
-                (),
-                |row| {
-                    let addr: String = row.get(0)?;
-                    Ok(addr)
-                },
-            )?;
             for RemovedTransportData { addr, timestamp } in removed_transports {
-                if *addr == configured_addr {
-                    continue;
+                let count: i64 =
+                    transaction
+                        .query_row("SELECT COUNT(*) FROM transports", (), |row| row.get(0))?;
+                if count <= 1 {
+                    // Removing the last transport would unconfigure the account.
+                    break;
                 }
                 modified |= transaction.execute(
                     "DELETE FROM transports
@@ -817,22 +661,67 @@ pub(crate) async fn sync_transports(
                     (addr, timestamp),
                 )?;
             }
-            Ok(())
+
+            maybe_reelect_local_primary(transaction)
         })
         .await?;
 
+    if let Some(new_addr) = reelected {
+        info!(context, "Re-elected primary transport {new_addr:?}.");
+        context.sql.uncache_raw_config("configured_addr").await;
+        modified = true;
+    }
+
     if modified {
         context.self_public_key.lock().await.take();
-        tokio::task::spawn(restart_io_if_running_boxed(context.clone()));
+        context
+            .restart_io_after_fetch
+            .store(true, Ordering::Relaxed);
         context.emit_event(EventType::TransportsModified);
     }
     Ok(())
 }
 
-/// Same as `context.restart_io_if_running()`, but `Box::pin`ed and with a `+ Send` bound,
-/// so that it can be called recursively.
-fn restart_io_if_running_boxed(context: Context) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-    Box::pin(async move { context.restart_io_if_running().await })
+/// Elects a new primary transport for the device if the current one
+/// is not published or vanished, and there is a better candidate.
+///
+/// Returns the newly elected address if the primary transport changed.
+fn maybe_reelect_local_primary(transaction: &mut rusqlite::Transaction) -> Result<Option<String>> {
+    let configured_addr: String = transaction.query_row(
+        "SELECT value FROM config WHERE keyname='configured_addr'",
+        (),
+        |row| row.get(0),
+    )?;
+    // Newest transports first, they are the most likely to work.
+    let transports: Vec<(String, bool)> = transaction
+        .prepare(
+            "SELECT addr, is_published FROM transports
+             ORDER BY add_timestamp DESC, id DESC",
+        )?
+        .query_map((), |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    // Nothing to do if the current primary is still there and published.
+    if transports
+        .iter()
+        .any(|(addr, is_published)| *is_published && *addr == configured_addr)
+    {
+        return Ok(None);
+    }
+    // Take an unpublished transport only if nothing is published.
+    let published = transports.iter().find(|(_, is_published)| *is_published);
+    let Some((new_addr, _)) = published.or_else(|| transports.first()) else {
+        return Ok(None);
+    };
+    if *new_addr == configured_addr {
+        // The primary transport may be the only remaining one.
+        return Ok(None);
+    }
+    transaction.execute(
+        "UPDATE config SET value=? WHERE keyname='configured_addr'",
+        (new_addr,),
+    )?;
+    Ok(Some(new_addr.clone()))
 }
 
 /// Adds transport entry to the `transports` table with empty configuration.
@@ -843,7 +732,7 @@ pub(crate) async fn add_pseudo_transport(context: &Context, addr: &str) -> Resul
             (
                 addr,
                 serde_json::to_string(&EnteredLoginParam{addr: addr.to_string(), ..Default::default()})?,
-                format!(r#"{{"addr":"{addr}","imap":[],"imap_user":"","imap_password":"","smtp":[],"smtp_user":"","smtp_password":"","certificate_checks":"Automatic"}}"#)
+                format!(r#"{{"addr":"{addr}","imap":[],"imap_user":"","imap_password":"","smtp":[],"smtp_user":"","smtp_password":"","certificate_checks":"Automatic","oauth2":false}}"#)
             ),
         )
         .await?;

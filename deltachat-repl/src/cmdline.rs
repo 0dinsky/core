@@ -5,9 +5,10 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{Result, bail, ensure};
 use deltachat::chat::{self, Chat, ChatId, ChatItem, ChatVisibility, MuteDuration};
 use deltachat::chatlist::*;
+use deltachat::config;
 use deltachat::constants::*;
 use deltachat::contact::*;
 use deltachat::context::*;
@@ -24,7 +25,6 @@ use deltachat::reaction::send_reaction;
 use deltachat::receive_imf::*;
 use deltachat::sql;
 use deltachat::tools::*;
-use deltachat::{config, provider};
 use tokio::fs;
 
 /// Reset database tables.
@@ -395,7 +395,6 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                  joinqr <qr-content>\n\
                  setqr <qr-content>\n\
                  createqrsvg <qr-content>\n\
-                 providerinfo <addr>\n\
                  fileinfo <file>\n\
                  estimatedeletion <seconds>\n\
                  clear -- clear screen\n\
@@ -1204,33 +1203,14 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             fs::write(&file, svg).await?;
             println!("{file:#?} written.");
         }
-        "providerinfo" => {
-            ensure!(!arg1.is_empty(), "Argument <addr> missing.");
-            match provider::get_provider_info(arg1) {
-                Some(info) => {
-                    println!("Information for provider belonging to {arg1}:");
-                    println!("status: {}", info.status as u32);
-                    println!("before_login_hint: {}", info.before_login_hint);
-                    println!("after_login_hint: {}", info.after_login_hint);
-                    println!("overview_page: {}", info.overview_page);
-                    for server in info.server.iter() {
-                        println!("server: {}:{}", server.hostname, server.port,);
-                    }
-                }
-                None => {
-                    println!("No information for provider belonging to {arg1} found.");
-                }
-            }
-        }
         "fileinfo" => {
             ensure!(!arg1.is_empty(), "Argument <file> missing.");
 
-            if let Ok(buf) = read_file(&context, Path::new(arg1)).await {
-                let (width, height) = get_filemeta(&buf)?;
-                println!("width={width}, height={height}");
-            } else {
+            let Ok(buf) = read_file(&context, Path::new(arg1)).await else {
                 bail!("Command failed.");
-            }
+            };
+            let (width, height) = get_filemeta(&buf)?;
+            println!("width={width}, height={height}");
         }
         "estimatedeletion" => {
             ensure!(!arg1.is_empty(), "Argument <seconds> missing");
