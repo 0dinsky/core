@@ -233,8 +233,8 @@ pub struct InnerContext {
     running_state: RwLock<RunningState>,
     /// Mutex to prevent a race condition when a "your pw is wrong" warning is sent, resulting in multiple messages being sent.
     pub(crate) wrong_pw_warning_mutex: Mutex<()>,
-    /// Mutex to prevent running housekeeping from multiple threads at once.
-    pub(crate) housekeeping_mutex: Mutex<()>,
+    /// Mutex to prevent running housekeeping or relay management from multiple threads at once.
+    pub(crate) background_task_mutex: Mutex<()>,
 
     /// Mutex to prevent multiple IMAP loops from fetching the messages at once.
     ///
@@ -258,6 +258,14 @@ pub struct InnerContext {
     ///
     /// This causes [`Context::wait_next_msgs`] to wake up.
     pub(crate) new_msgs_notify: Notify,
+
+    /// Whether IO should be restarted after the current fetch cycle completed.
+    ///
+    /// Set when a fetched transport sync message modified the transports.
+    /// Restarting from within the inbox loop would cancel it,
+    /// losing the remaining processing of the sync message
+    /// which is already stored and is never fetched again.
+    pub(crate) restart_io_after_fetch: AtomicBool,
 
     /// Server ID response if ID capability is supported
     /// and the server returned non-NIL on the inbox connection.
@@ -296,9 +304,6 @@ pub struct InnerContext {
     /// Push subscriber to store device token.
     pub(crate) push_subscriber: PushSubscriber,
 
-    /// True if account has subscribed to push notifications via IMAP.
-    pub(crate) push_subscribed: AtomicBool,
-
     /// TLS session resumption cache.
     pub(crate) tls_session_store: TlsSessionStore,
 
@@ -324,9 +329,9 @@ pub struct InnerContext {
     /// Mutex is also held while generating the key to avoid generating the key twice.
     pub(crate) self_public_key: Mutex<Option<SignedPublicKey>>,
 
-    /// `Connectivity` values for mailboxes, unordered. Used to compute the aggregate connectivity,
+    /// `Connectivity` values for published relays, unordered. Used to compute the aggregate connectivity,
     /// see [`Context::get_connectivity()`].
-    pub(crate) connectivities: parking_lot::Mutex<Vec<ConnectivityStore>>,
+    pub(crate) published_connectivities: parking_lot::Mutex<Vec<ConnectivityStore>>,
 }
 
 /// The state of ongoing process.
@@ -482,7 +487,7 @@ impl Context {
             running_state: RwLock::new(Default::default()),
             sql: Sql::new(dbfile),
             wrong_pw_warning_mutex: Mutex::new(()),
-            housekeeping_mutex: Mutex::new(()),
+            background_task_mutex: Mutex::new(()),
             fetch_msgs_mutex: Mutex::new(()),
             translated_stockstrings: stockstrings,
             events,
@@ -490,6 +495,7 @@ impl Context {
             ratelimit: RwLock::new(Ratelimit::new(Duration::new(3, 0), 3.0)), // Allow at least 1 message every second + a burst of 3.
             quota: RwLock::new(BTreeMap::new()),
             new_msgs_notify,
+            restart_io_after_fetch: AtomicBool::new(false),
             server_id: RwLock::new(None),
             metadata: RwLock::new(BTreeMap::new()),
             creation_time: tools::Time::now(),
@@ -497,13 +503,12 @@ impl Context {
             migration_error: parking_lot::RwLock::new(None),
             debug_logging: std::sync::RwLock::new(None),
             push_subscriber,
-            push_subscribed: AtomicBool::new(false),
             tls_session_store: TlsSessionStore::new(),
             spki_hash_store: SpkiHashStore::new(),
             iroh: Arc::new(RwLock::new(None)),
             self_fingerprint: OnceLock::new(),
             self_public_key: Mutex::new(None),
-            connectivities: parking_lot::Mutex::new(Vec::new()),
+            published_connectivities: parking_lot::Mutex::new(Vec::new()),
         };
 
         let ctx = Context {
@@ -840,7 +845,7 @@ impl Context {
         let all_transports: Vec<String> = ConfiguredLoginParam::load_all(self)
             .await?
             .into_iter()
-            .map(|(transport_id, param)| format!("{transport_id}: {param}"))
+            .map(|(transport_id, param, _)| format!("{transport_id}: {param}"))
             .collect();
         let all_transports = if all_transports.is_empty() {
             "Not configured".to_string()
@@ -967,6 +972,12 @@ impl Context {
                 .to_string(),
         );
         res.insert(
+            "last_reactions_broadcast",
+            self.get_config_int(Config::LastReactionsBroadcast)
+                .await?
+                .to_string(),
+        );
+        res.insert(
             "last_cant_decrypt_outgoing_msgs",
             self.get_config_int(Config::LastCantDecryptOutgoingMsgs)
                 .await?
@@ -1040,6 +1051,24 @@ impl Context {
         res.insert(
             "force_encryption",
             self.get_config_bool(Config::ForceEncryption)
+                .await?
+                .to_string(),
+        );
+        res.insert(
+            "last_automatic_relay_management",
+            self.get_config_i64(Config::LastAutomaticRelayManagement)
+                .await?
+                .to_string(),
+        );
+        res.insert(
+            "automatic_relay_management",
+            self.get_config_bool(Config::AutomaticRelayManagement)
+                .await?
+                .to_string(),
+        );
+        res.insert(
+            "automatic_relay_management_finished",
+            self.get_config_bool(Config::AutomaticRelayManagementFinished)
                 .await?
                 .to_string(),
         );

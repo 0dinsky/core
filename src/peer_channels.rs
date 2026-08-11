@@ -253,13 +253,15 @@ impl Context {
             RelayMode::Default
         };
 
-        let endpoint = Endpoint::builder()
-            .tls_x509() // For compatibility with iroh <0.34.0
-            .secret_key(secret_key)
-            .alpns(vec![GOSSIP_ALPN.to_vec()])
-            .relay_mode(relay_mode)
-            .bind()
-            .await?;
+        let endpoint = Box::pin(
+            Endpoint::builder()
+                .tls_x509() // For compatibility with iroh <0.34.0
+                .secret_key(secret_key)
+                .alpns(vec![GOSSIP_ALPN.to_vec()])
+                .relay_mode(relay_mode)
+                .bind(),
+        )
+        .await?;
 
         // create gossip
         // Allow messages up to 128 KB in size.
@@ -819,6 +821,7 @@ mod tests {
                     .node_id
             ]
         );
+        bob.assert_warn("Cannot add iroh peer").await;
         Ok(())
     }
 
@@ -1089,7 +1092,7 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         };
-
+        fiona.assert_warn("Missing key for bob@example.net").await;
         let realtime_receive_loop = async {
             loop {
                 let event = fiona.evtracker.recv().await.unwrap();

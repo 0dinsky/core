@@ -97,7 +97,7 @@ class ChatType(str, Enum):
     """Chat type."""
 
     SINGLE = "Single"
-    """1:1 chat, i.e. a direct chat with a single contact"""
+    """Single chat (a chat with a with a single contact)"""
 
     GROUP = "Group"
 
@@ -244,13 +244,6 @@ class ProviderStatus(IntEnum):
     OK = 1
     PREPARATION = 2
     BROKEN = 3
-
-
-class PushNotifyState(IntEnum):
-    """Push notifications state."""
-
-    NOT_CONNECTED = 0
-    CONNECTED = 2
 
 
 class ShowEmails(IntEnum):

@@ -35,15 +35,18 @@ use crate::download::{
 use crate::ensure_and_debug_assert_eq;
 use crate::ephemeral::{Timer as EphemeralTimer, start_chat_ephemeral_timers};
 use crate::events::EventType;
+use crate::key;
 use crate::key::{Fingerprint, self_fingerprint};
 use crate::location;
 use crate::log::{LogExt, warn};
 use crate::logged_debug_assert;
 use crate::message::{self, Message, MessageState, MsgId, Viewtype};
+use crate::mimefactory;
 use crate::mimefactory::{MimeFactory, RenderedEmail};
 use crate::mimeparser::SystemMessage;
 use crate::param::{Param, Params};
 use crate::pgp::addresses_from_public_key;
+use crate::reaction::broadcast_reactions;
 use crate::receive_imf::ReceivedMsg;
 use crate::smtp::{self, send_msg_to_smtp};
 use crate::stock_str;
@@ -117,7 +120,7 @@ pub(crate) enum CantSendReason {
     /// Not a member of the chat.
     NotAMember,
 
-    /// State for 1:1 chat with a key-contact that does not have a key.
+    /// State for single chat with a key-contact that does not have a key.
     MissingKey,
 }
 
@@ -214,7 +217,7 @@ impl ChatId {
         Some(msg.chat_id)
     }
 
-    /// Returns the [`ChatId`] for the 1:1 chat with `contact_id`
+    /// Returns the [`ChatId`] for the single chat with `contact_id`
     /// if it exists and is not blocked.
     ///
     /// If the chat does not exist or is blocked, `None` is returned.
@@ -234,7 +237,7 @@ impl ChatId {
         Ok(chat_id)
     }
 
-    /// Returns the [`ChatId`] for the 1:1 chat with `contact_id`.
+    /// Returns the [`ChatId`] for the single chat with `contact_id`.
     ///
     /// If the chat does not yet exist an unblocked chat ([`Blocked::Not`]) is created.
     ///
@@ -247,9 +250,9 @@ impl ChatId {
             .map(|chat| chat.id)
     }
 
-    /// Returns the unblocked 1:1 chat with `contact_id`.
+    /// Returns the unblocked single chat with `contact_id`.
     ///
-    /// This should be used when **a user action** creates a chat 1:1, it ensures the chat
+    /// This should be used when **a user action** creates a single chat, it ensures the chat
     /// exists, is unblocked and scales the [`Contact`]'s origin.
     pub async fn create_for_contact(context: &Context, contact_id: ContactId) -> Result<Self> {
         ChatId::create_for_contact_with_blocked(context, contact_id, Blocked::Not).await
@@ -394,7 +397,7 @@ impl ChatId {
                     if contact_id != ContactId::SELF {
                         info!(
                             context,
-                            "Blocking the contact {contact_id} to block 1:1 chat."
+                            "Blocking the contact {contact_id} to block a single chat."
                         );
                         contact::set_blocked(context, Nosync, contact_id, true).await?;
                     }
@@ -413,7 +416,7 @@ impl ChatId {
         chatlist_events::emit_chatlist_changed(context);
 
         if sync.into() {
-            // NB: For a 1:1 chat this currently triggers `Contact::block()` on other devices.
+            // NB: For a single chat this currently triggers `Contact::block()` on other devices.
             chat.sync(context, SyncAction::Block)
                 .await
                 .log_err(context)
@@ -437,7 +440,7 @@ impl ChatId {
 
         if sync.into() {
             let chat = Chat::load_from_db(context, self).await?;
-            // TODO: For a 1:1 chat this currently triggers `Contact::unblock()` on other devices.
+            // TODO: For a single chat this currently triggers `Contact::unblock()` on other devices.
             // Maybe we should unblock the contact locally too, this would also resolve discrepancy
             // with `block()` which also blocks the contact.
             chat.sync(context, SyncAction::Unblock)
@@ -797,7 +800,14 @@ SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
     }
 
     /// Set provided message as draft message for specified chat.
-    /// Returns true if the draft was added or updated in place.
+    ///
+    /// If there is an existing draft message,
+    /// this function tries to update it instead of creating a new one,
+    /// thus preserving the ID and possible WebXDC status updates
+    /// associated with the draft message.
+    ///
+    /// Returns `false` if the existing draft is already at the state
+    /// that the caller tried to set it to, so it was unchanged.
     async fn do_set_draft(self, context: &Context, msg: &mut Message) -> Result<bool> {
         match msg.viewtype {
             Viewtype::Unknown => bail!("Can not set draft of unknown type."),
@@ -1174,7 +1184,7 @@ SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
             MessageState::InSeen as u32,
             state_out_min as u32,
             // Do not reply to not fully downloaded messages. Such a message could be a group chat
-            // message that we assigned to 1:1 chat.
+            // message that we assigned to a single chat.
             DownloadState::Done as u32,
             // Do not reference info messages, they are not actually sent out
             // and have Message-IDs unknown to other chat members.
@@ -1367,7 +1377,7 @@ pub struct Chat {
     /// Database ID.
     pub id: ChatId,
 
-    /// Chat type, e.g. 1:1 chat, group chat, mailing list.
+    /// Chat type, e.g. a single chat, group chat, mailing list.
     pub typ: Chattype,
 
     /// Chat name.
@@ -1376,7 +1386,7 @@ pub struct Chat {
     /// Whether the chat is archived or pinned.
     pub visibility: ChatVisibility,
 
-    /// Group ID. For [`Chattype::Mailinglist`] -- mailing list address. Empty for 1:1 chats and
+    /// Group ID. For [`Chattype::Mailinglist`] -- mailing list address. Empty for single chats and
     /// ad-hoc groups.
     pub grpid: String,
 
@@ -1604,7 +1614,7 @@ impl Chat {
                 Path::new(&get_unencrypted_icon(context).await?),
             )));
         } else if self.typ == Chattype::Single {
-            // For 1:1 chats, we always use the same avatar as for the contact
+            // For single chats, we always use the same avatar as for the contact
             // This is before the `self.is_encrypted()` check, because that function
             // has two database calls, i.e. it's slow
             let contacts = get_chat_contacts(context, self.id).await?;
@@ -1623,7 +1633,7 @@ impl Chat {
 
     /// Returns chat avatar color.
     ///
-    /// For 1:1 chats, the color is calculated from the contact's address
+    /// For single chats, the color is calculated from the contact's address
     /// for address-contacts and from the OpenPGP key fingerprint for key-contacts.
     /// For group chats the color is calculated from the grpid, if present, or the chat name.
     pub async fn get_color(&self, context: &Context) -> Result<u32> {
@@ -1912,7 +1922,7 @@ impl Chat {
         };
         let ephemeral_timestamp = match ephemeral_timer {
             EphemeralTimer::Disabled => 0,
-            EphemeralTimer::Enabled { duration } => time().saturating_add(duration.into()),
+            EphemeralTimer::Enabled { duration } => time().saturating_add(duration.get().into()),
         };
 
         let (msg_text, was_truncated) = truncate_msg_text(context, msg.text.clone()).await?;
@@ -2358,7 +2368,7 @@ pub(crate) struct ChatIdBlocked {
 }
 
 impl ChatIdBlocked {
-    /// Searches the database for the 1:1 chat with this contact.
+    /// Searches the database for the single chat with this contact.
     ///
     /// If no chat is found `None` is returned.
     pub async fn lookup_by_contact(
@@ -2391,7 +2401,7 @@ impl ChatIdBlocked {
             .await
     }
 
-    /// Returns the chat for the 1:1 chat with this contact.
+    /// Returns the chat for the single chat with this contact.
     ///
     /// If the chat does not yet exist a new one is created, using the provided [`Blocked`]
     /// state.
@@ -2478,118 +2488,121 @@ impl ChatIdBlocked {
 async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
     if msg.viewtype == Viewtype::Text || msg.viewtype == Viewtype::Call {
         // the caller should check if the message text is empty
-    } else if msg.viewtype.has_file() {
-        let viewtype_orig = msg.viewtype;
-        let mut blob = msg
-            .param
-            .get_file_blob(context)?
-            .with_context(|| format!("attachment missing for message of type #{}", msg.viewtype))?;
-        let mut maybe_image = false;
-
-        if msg.viewtype == Viewtype::File || msg.viewtype == Viewtype::Image {
-            // Correct the type, take care not to correct already very special
-            // formats as GIF or VOICE.
-            //
-            // Typical conversions:
-            // - from FILE to AUDIO/VIDEO/IMAGE
-            // - from FILE/IMAGE to GIF */
-            if let Some((better_type, _)) = message::guess_msgtype_from_suffix(msg) {
-                if better_type == Viewtype::Image {
-                    maybe_image = true;
-                } else if better_type != Viewtype::Webxdc
-                    || context
-                        .ensure_sendable_webxdc_file(&blob.to_abs_path())
-                        .await
-                        .is_ok()
-                {
-                    msg.viewtype = better_type;
-                }
-            }
-        } else if msg.viewtype == Viewtype::Webxdc {
-            context
-                .ensure_sendable_webxdc_file(&blob.to_abs_path())
-                .await?;
-        }
-
-        if msg.viewtype == Viewtype::Vcard {
-            msg.try_set_vcard(context, &blob.to_abs_path()).await?;
-        }
-        if msg.viewtype == Viewtype::File && maybe_image || msg.viewtype == Viewtype::Image {
-            let new_name = blob
-                .check_or_recode_image(context, msg.get_filename(), &mut msg.viewtype)
-                .await?;
-            msg.param.set(Param::Filename, new_name);
-            msg.param.set(Param::File, blob.as_name());
-        }
-
-        if !msg.param.exists(Param::MimeType)
-            && let Some((viewtype, mime)) = message::guess_msgtype_from_suffix(msg)
-        {
-            // If we unexpectedly didn't recognize the file as image, don't send it as such,
-            // either the format is unsupported or the image is corrupted.
-            let mime = match viewtype != Viewtype::Image
-                || matches!(msg.viewtype, Viewtype::Image | Viewtype::Sticker)
-            {
-                true => mime,
-                false => "application/octet-stream",
-            };
-            msg.param.set(Param::MimeType, mime);
-        }
-
-        msg.try_calc_and_set_dimensions(context).await?;
-
-        let filename = msg.get_filename().context("msg has no file")?;
-        let suffix = Path::new(&filename)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("dat");
-        // Get file name to use for sending. For privacy purposes, we do not transfer the original
-        // filenames e.g. for images; these names are normally not needed and contain timestamps,
-        // running numbers, etc.
-        let filename: String = match viewtype_orig {
-            Viewtype::Voice => format!(
-                "voice-messsage_{}.{suffix}",
-                chrono::Utc
-                    .timestamp_opt(msg.timestamp_sort, 0)
-                    .single()
-                    .map_or_else(
-                        || "YY-mm-dd_hh:mm:ss".to_string(),
-                        |ts| ts.format("%Y-%m-%d_%H-%M-%S").to_string()
-                    ),
-            ),
-            Viewtype::Image | Viewtype::Gif => format!(
-                "image_{}.{suffix}",
-                chrono::Utc
-                    .timestamp_opt(msg.timestamp_sort, 0)
-                    .single()
-                    .map_or_else(
-                        || "YY-mm-dd_hh:mm:ss".to_string(),
-                        |ts| ts.format("%Y-%m-%d_%H-%M-%S").to_string(),
-                    ),
-            ),
-            Viewtype::Video => format!(
-                "video_{}.{suffix}",
-                chrono::Utc
-                    .timestamp_opt(msg.timestamp_sort, 0)
-                    .single()
-                    .map_or_else(
-                        || "YY-mm-dd_hh:mm:ss".to_string(),
-                        |ts| ts.format("%Y-%m-%d_%H-%M-%S").to_string()
-                    ),
-            ),
-            _ => filename,
-        };
-        msg.param.set(Param::Filename, filename);
-
-        info!(
-            context,
-            "Attaching \"{}\" for message type #{}.",
-            blob.to_abs_path().display(),
-            msg.viewtype
-        );
-    } else {
+        return Ok(());
+    }
+    if !msg.viewtype.has_file() {
         bail!("Cannot send messages of type #{}.", msg.viewtype);
     }
+
+    let viewtype_orig = msg.viewtype;
+    let mut blob = msg
+        .param
+        .get_file_blob(context)?
+        .with_context(|| format!("attachment missing for message of type #{}", msg.viewtype))?;
+    let mut maybe_image = false;
+
+    if msg.viewtype == Viewtype::File || msg.viewtype == Viewtype::Image {
+        // Correct the type, take care not to correct already very special
+        // formats as GIF or VOICE.
+        //
+        // Typical conversions:
+        // - from FILE to AUDIO/VIDEO/IMAGE
+        // - from FILE/IMAGE to GIF */
+        if let Some((better_type, _)) = message::guess_msgtype_from_suffix(msg) {
+            if better_type == Viewtype::Image {
+                maybe_image = true;
+            } else if better_type != Viewtype::Webxdc
+                || context
+                    .ensure_sendable_webxdc_file(&blob.to_abs_path())
+                    .await
+                    .is_ok()
+            {
+                msg.viewtype = better_type;
+            }
+        }
+    } else if msg.viewtype == Viewtype::Webxdc {
+        context
+            .ensure_sendable_webxdc_file(&blob.to_abs_path())
+            .await?;
+    }
+
+    if msg.viewtype == Viewtype::Vcard {
+        msg.try_set_vcard(context, &blob.to_abs_path()).await?;
+    }
+    if msg.viewtype == Viewtype::File && maybe_image || msg.viewtype == Viewtype::Image {
+        let new_name = blob
+            .check_or_recode_image(context, msg.get_filename(), &mut msg.viewtype)
+            .await?;
+        msg.param.set(Param::Filename, new_name);
+        msg.param.set(Param::File, blob.as_name());
+    }
+
+    if !msg.param.exists(Param::MimeType)
+        && let Some((viewtype, mime)) = message::guess_msgtype_from_suffix(msg)
+    {
+        // If we unexpectedly didn't recognize the file as image, don't send it as such,
+        // either the format is unsupported or the image is corrupted.
+        let mime = match viewtype != Viewtype::Image
+            || matches!(msg.viewtype, Viewtype::Image | Viewtype::Sticker)
+        {
+            true => mime,
+            false => "application/octet-stream",
+        };
+        msg.param.set(Param::MimeType, mime);
+    }
+
+    msg.try_calc_and_set_dimensions(context).await?;
+
+    let filename = msg.get_filename().context("msg has no file")?;
+    let suffix = Path::new(&filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("dat");
+    // Get file name to use for sending. For privacy purposes, we do not transfer the original
+    // filenames e.g. for images; these names are normally not needed and contain timestamps,
+    // running numbers, etc.
+    let filename: String = match viewtype_orig {
+        Viewtype::Voice => format!(
+            "voice-messsage_{}.{suffix}",
+            chrono::Utc
+                .timestamp_opt(msg.timestamp_sort, 0)
+                .single()
+                .map_or_else(
+                    || "YY-mm-dd_hh:mm:ss".to_string(),
+                    |ts| ts.format("%Y-%m-%d_%H-%M-%S").to_string()
+                ),
+        ),
+        Viewtype::Image | Viewtype::Gif => format!(
+            "image_{}.{suffix}",
+            chrono::Utc
+                .timestamp_opt(msg.timestamp_sort, 0)
+                .single()
+                .map_or_else(
+                    || "YY-mm-dd_hh:mm:ss".to_string(),
+                    |ts| ts.format("%Y-%m-%d_%H-%M-%S").to_string(),
+                ),
+        ),
+        Viewtype::Video => format!(
+            "video_{}.{suffix}",
+            chrono::Utc
+                .timestamp_opt(msg.timestamp_sort, 0)
+                .single()
+                .map_or_else(
+                    || "YY-mm-dd_hh:mm:ss".to_string(),
+                    |ts| ts.format("%Y-%m-%d_%H-%M-%S").to_string()
+                ),
+        ),
+        _ => filename,
+    };
+    msg.param.set(Param::Filename, filename);
+
+    info!(
+        context,
+        "Attaching \"{}\" for message type #{}.",
+        blob.to_abs_path().display(),
+        msg.viewtype
+    );
+
     Ok(())
 }
 
@@ -2599,11 +2612,11 @@ pub async fn is_contact_in_chat(
     chat_id: ChatId,
     contact_id: ContactId,
 ) -> Result<bool> {
-    // this function works for group and for normal chats, however, it is more useful
+    // this function works for group and for single chats, however, it is more useful
     // for group chats.
     // ContactId::SELF may be used to check whether oneself
     // is in a group or incoming broadcast chat
-    // (ContactId::SELF is not added to 1:1 chats or outgoing broadcast channels)
+    // (ContactId::SELF is not added to single chats or outgoing broadcast channels)
 
     let exists = context
         .sql
@@ -2695,10 +2708,11 @@ async fn prepare_send_msg(
         // from the chat.
         CantSendReason::NotAMember => msg.param.get_cmd() == SystemMessage::MemberRemovedFromGroup,
         CantSendReason::InBroadcast => {
-            matches!(
-                msg.param.get_cmd(),
-                SystemMessage::MemberRemovedFromGroup | SystemMessage::SecurejoinMessage
-            )
+            msg.param.get_int(Param::Reaction).unwrap_or_default() != 0
+                || matches!(
+                    msg.param.get_cmd(),
+                    SystemMessage::MemberRemovedFromGroup | SystemMessage::SecurejoinMessage
+                )
         }
         CantSendReason::MissingKey => msg
             .param
@@ -2776,6 +2790,10 @@ async fn render_mime_message_and_pre_message(
     msg: &mut Message,
     mimefactory: MimeFactory,
 ) -> Result<(Option<RenderedEmail>, RenderedEmail)> {
+    let from_addr = context.get_primary_self_addr().await?;
+    let public_key = key::load_self_public_key(context).await?;
+    let secret_key = key::load_self_secret_key(context).await?;
+
     let needs_pre_message = msg.viewtype.has_file()
         && mimefactory.will_be_encrypted() // unencrypted is likely email, we don't want to spam by sending multiple messages
         && msg
@@ -2792,15 +2810,31 @@ async fn render_mime_message_and_pre_message(
 
         let mut mimefactory_post_msg = mimefactory.clone();
         mimefactory_post_msg.set_as_post_message();
-        let rendered_msg = Box::pin(mimefactory_post_msg.render(context))
+        let (queued_msg, side_effects) = Box::pin(mimefactory_post_msg.into_queued_mail(context))
             .await
             .context("Failed to render post-message")?;
 
+        let rendered_msg = mimefactory::render_queued_mail(
+            queued_msg,
+            &public_key,
+            &secret_key,
+            from_addr.clone(),
+            side_effects,
+        )?;
+
         let mut mimefactory_pre_msg = mimefactory;
         mimefactory_pre_msg.set_as_pre_message_for(&rendered_msg);
-        let rendered_pre_msg = Box::pin(mimefactory_pre_msg.render(context))
-            .await
-            .context("pre-message failed to render")?;
+        let (queued_pre_msg, pre_side_effects) =
+            Box::pin(mimefactory_pre_msg.into_queued_mail(context))
+                .await
+                .context("pre-message failed to render")?;
+        let rendered_pre_msg = mimefactory::render_queued_mail(
+            queued_pre_msg,
+            &public_key,
+            &secret_key,
+            from_addr,
+            pre_side_effects,
+        )?;
 
         if rendered_pre_msg.message.len() > PRE_MSG_SIZE_WARNING_THRESHOLD {
             warn!(
@@ -2813,7 +2847,16 @@ async fn render_mime_message_and_pre_message(
 
         Ok((Some(rendered_pre_msg), rendered_msg))
     } else {
-        Ok((None, Box::pin(mimefactory.render(context)).await?))
+        let (queued_msg, side_effects) = Box::pin(mimefactory.into_queued_mail(context)).await?;
+        let rendered_msg = mimefactory::render_queued_mail(
+            queued_msg,
+            &public_key,
+            &secret_key,
+            from_addr,
+            side_effects,
+        )?;
+
+        Ok((None, rendered_msg))
     }
 }
 
@@ -2858,13 +2901,7 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
             return Err(err);
         }
     };
-    let attach_selfavatar = mimefactory.attach_selfavatar;
     let mut recipients = mimefactory.recipients();
-
-    let from = context.get_primary_self_addr().await?;
-    let lowercase_from = from.to_lowercase();
-
-    recipients.retain(|x| x.to_lowercase() != lowercase_from);
 
     // Default Webxdc integrations are hidden messages and must not be sent out:
     if (msg.param.get_int(Param::WebxdcIntegration).is_some() && msg.hidden)
@@ -2945,14 +2982,22 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
 
     let now = time();
 
-    if let Some(last_added_location_timestamp) = rendered_msg.last_added_location_timestamp {
+    if let Some(last_added_location_timestamp) =
+        rendered_msg.side_effects.last_added_location_timestamp
+    {
         location::set_kml_sent_timestamp(context, msg.chat_id, last_added_location_timestamp)
             .await?;
     }
 
-    if attach_selfavatar && let Err(err) = msg.chat_id.set_selfavatar_timestamp(context, now).await
+    if rendered_msg.side_effects.avatar_is_attached
+        || rendered_pre_msg
+            .as_ref()
+            .is_some_and(|msg| msg.side_effects.avatar_is_attached)
     {
-        error!(context, "Failed to set selfavatar timestamp: {err:#}.");
+        msg.chat_id
+            .set_selfavatar_timestamp(context, now)
+            .await
+            .context("Failed to set selfavatar timestamp")?;
     }
 
     if rendered_msg.is_encrypted {
@@ -2960,7 +3005,7 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
     } else {
         msg.param.remove(Param::GuaranteeE2ee);
     }
-    msg.subject.clone_from(&rendered_msg.subject);
+    msg.subject.clone_from(&rendered_msg.side_effects.subject);
     // Sort the message to the bottom. Employ `msgs_index7` to compute `timestamp`.
     context
         .sql
@@ -2992,7 +3037,7 @@ WHERE id=?
     let trans_fn = |t: &mut rusqlite::Transaction| {
         let mut row_ids = Vec::<i64>::new();
 
-        if let Some(sync_ids) = rendered_msg.sync_ids_to_delete {
+        if let Some(sync_ids) = rendered_msg.side_effects.sync_ids_to_delete {
             t.execute(
                 &format!("DELETE FROM multi_device_sync WHERE id IN ({sync_ids})"),
                 (),
@@ -3512,7 +3557,7 @@ pub async fn get_chat_media(
 
 /// Returns a vector of contact IDs for given chat ID.
 pub async fn get_chat_contacts(context: &Context, chat_id: ChatId) -> Result<Vec<ContactId>> {
-    // Normal chats do not include SELF.  Group chats do (as it may happen that one is deleted from a
+    // Single chats do not include SELF.  Group chats do (as it may happen that one is deleted from a
     // groupchat but the chats stays visible, moreover, this makes displaying lists easier)
     context
         .sql
@@ -3737,14 +3782,15 @@ pub(crate) async fn create_out_broadcast_ex(
 
         t.execute(
             "INSERT INTO chats
-            (type, name, name_normalized, grpid, created_timestamp, param)
-            VALUES(?, ?, ?, ?, ?, ?)",
+            (type, name, name_normalized, grpid, created_timestamp, muted_until, param)
+            VALUES(?, ?, ?, ?, ?, ?, ?)",
             (
                 Chattype::OutBroadcast,
                 &chat_name,
                 normalize_text(&chat_name),
                 &grpid,
                 timestamp,
+                MuteDuration::Forever,
                 params.to_string(),
             ),
         )?;
@@ -3946,7 +3992,7 @@ pub(crate) async fn add_contact_to_chat_ex(
 
     chat_id.reset_gossiped_timestamp(context).await?;
 
-    // this also makes sure, no contacts are added to special or normal chats
+    // this also makes sure, no contacts are added to special or single chats
     let mut chat = Chat::load_from_db(context, chat_id).await?;
     ensure!(
         chat.typ == Chattype::Group || (from_handshake && chat.typ == Chattype::OutBroadcast),
@@ -4052,7 +4098,8 @@ pub(crate) async fn add_contact_to_chat_ex(
         chat.sync_contacts(context).await.log_err(context).ok();
     }
     if chat.typ == Chattype::OutBroadcast {
-        resend_last_msgs(context, chat.id, &contact)
+        let msgs = get_broadcast_msgs_to_resend(context, chat_id).await?;
+        resend_msgs_ex(context, &msgs, contact.fingerprint())
             .await
             .log_err(context)
             .ok();
@@ -4060,28 +4107,37 @@ pub(crate) async fn add_contact_to_chat_ex(
     Ok(true)
 }
 
-async fn resend_last_msgs(context: &Context, chat_id: ChatId, to_contact: &Contact) -> Result<()> {
-    let msgs: Vec<MsgId> = context
+/// Get the messages to resend to a newly joined broadcast member.
+///
+/// These are the most recent messages plus some of the latest pinned messages.
+///
+/// Regarding webxdcs: It is not trivial to resend only the own status updates,
+/// and it is not trivial to resend them only to the newly-joined member,
+/// so that for now, webxdcs are not resend at all.
+async fn get_broadcast_msgs_to_resend(context: &Context, chat_id: ChatId) -> Result<Vec<MsgId>> {
+    let msgs = context
         .sql
         .query_map_vec(
             "
-SELECT id
-FROM msgs
-WHERE chat_id=?
-    AND hidden=0
-    AND NOT ( -- Exclude info and system messages
-        param GLOB '*\nS=*' OR param GLOB 'S=*'
-        OR from_id=?
-        OR to_id=?
+SELECT id, timestamp FROM msgs WHERE id IN
+    (
+        SELECT id FROM msgs WHERE chat_id=?1 -- UNION requires simple SELECT statements without LIMIT; therefore the sub-SELECT
+            AND pinned=1 AND hidden=0 AND type!=?2
+            ORDER BY timestamp DESC, id DESC LIMIT ?3
     )
-    AND type!=?
-ORDER BY timestamp DESC, id DESC LIMIT ?",
+UNION SELECT id, timestamp FROM msgs WHERE id IN
+    (
+        SELECT id FROM msgs WHERE chat_id=?1
+            AND hidden=0 AND type!=?2
+            AND NOT (param GLOB '*\nS=*' OR param GLOB 'S=*' OR from_id=?4 OR to_id=?4) -- Exclude info and system messages
+            ORDER BY timestamp DESC, id DESC LIMIT ?3
+    )
+ORDER BY timestamp DESC, id DESC -- final ORDER BY is needed as UNION does not guarantee ordering",
             (
                 chat_id,
-                ContactId::INFO,
-                ContactId::INFO,
                 Viewtype::Webxdc,
                 constants::N_MSGS_TO_NEW_BROADCAST_MEMBER,
+                ContactId::INFO,
             ),
             |row: &rusqlite::Row| Ok(row.get::<_, MsgId>(0)?),
         )
@@ -4089,7 +4145,7 @@ ORDER BY timestamp DESC, id DESC LIMIT ?",
         .into_iter()
         .rev()
         .collect();
-    resend_msgs_ex(context, &msgs, to_contact.fingerprint()).await
+    Ok(msgs)
 }
 
 /// Returns true if an avatar should be attached in the given chat.
@@ -4446,7 +4502,7 @@ async fn rename_ex(
     new_name: &str,
 ) -> Result<()> {
     let new_name = sanitize_single_line(new_name);
-    /* the function only sets the names of group chats; normal chats get their names from the contacts */
+    /* the function only sets the names of group chats; single chats get their names from the contacts */
     let mut success = false;
 
     ensure!(!new_name.is_empty(), "Invalid name");
@@ -4677,6 +4733,7 @@ pub async fn forward_msgs_2ctx(
         msg.rfc724_mid = create_outgoing_rfc724_mid();
         msg.pre_rfc724_mid.clear();
         msg.timestamp_sort = now;
+        msg.pinned = false;
         chat.prepare_msg_raw(ctx_dst, &mut msg, None).await?;
 
         if !create_send_msg_jobs(ctx_dst, &mut msg).await?.is_empty() {
@@ -4798,10 +4855,7 @@ pub async fn resend_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
 /// Resends given messages to a contact with fingerprint `to_fingerprint` or, if it's `None`, to
 /// members of the corresponding chats.
 ///
-/// NB: Actually `to_fingerprint` is only passed for `OutBroadcast` chats when a new member is
-/// added. Regarding webxdcs: It is not trivial to resend only the own status updates,
-/// and it is not trivial to resend them only to the newly-joined member,
-/// so that for now, [`resend_last_msgs`] does not automatically resend webxdcs at all.
+/// `to_fingerprint` is only passed for `OutBroadcast` chats when a new member is added.
 pub(crate) async fn resend_msgs_ex(
     context: &Context,
     msg_ids: &[MsgId],
@@ -4836,6 +4890,11 @@ pub(crate) async fn resend_msgs_ex(
         }
         if let Some(to_fingerprint) = &to_fingerprint {
             msg.param.set(Param::Arg4, to_fingerprint.clone());
+            if let Some(json) = broadcast_reactions::render_json(context, &[msg.id]).await? {
+                // The returned reaction array for the message may be empty,
+                // so rejoining members get reactions cleared as neccessary.
+                msg.param.set(Param::BroadcastReactions, json);
+            }
         }
         if create_send_msg_jobs(context, &mut msg).await?.is_empty() {
             continue;

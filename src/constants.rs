@@ -99,7 +99,7 @@ pub const DC_CHAT_ID_LAST_SPECIAL: ChatId = ChatId::new(9);
 )]
 #[repr(u32)]
 pub enum Chattype {
-    /// A 1:1 chat, i.e. a normal chat with a single contact.
+    /// A single chat (a chat with a single contact).
     ///
     /// Created by [`ChatId::create_for_contact`].
     Single = 100,
@@ -211,7 +211,8 @@ Here is what to do:
 
 If you have any questions, please send an email to delta@merlinux.eu or ask at https://support.delta.chat/."#;
 
-/// How many recent messages should be re-sent to a new broadcast member.
+/// Number of recent messages that should be resent to a new broadcast member.
+/// Additionally, up to this amount of pinned messages will be resent.
 pub(crate) const N_MSGS_TO_NEW_BROADCAST_MEMBER: usize = 10;
 
 #[cfg(test)]

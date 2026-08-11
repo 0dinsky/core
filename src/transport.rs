@@ -9,7 +9,7 @@
 //! and configured list of connection candidates.
 
 use std::fmt;
-use std::pin::Pin;
+use std::sync::atomic::Ordering;
 
 use anyhow::{Context as _, Result, bail, format_err};
 use deltachat_contact_tools::{EmailAddress, addr_normalize};
@@ -30,7 +30,7 @@ pub(crate) enum ConnectionSecurity {
     /// Implicit TLS.
     Tls,
 
-    // STARTTLS.
+    /// STARTTLS.
     Starttls,
 
     /// Plaintext.
@@ -289,16 +289,21 @@ impl ConfiguredLoginParam {
     /// Loads configured login parameters for all transports.
     ///
     /// Returns a vector of all transport IDs
-    /// paired with the configured parameters for the transports.
-    pub(crate) async fn load_all(context: &Context) -> Result<Vec<(u32, Self)>> {
+    /// paired with the configured parameters for the transports and the published state.
+    pub(crate) async fn load_all(context: &Context) -> Result<Vec<(u32, Self, bool)>> {
         context
             .sql
-            .query_map_vec("SELECT id, configured_param FROM transports", (), |row| {
-                let id: u32 = row.get(0)?;
-                let json: String = row.get(1)?;
-                let param = Self::from_json(&json)?;
-                Ok((id, param))
-            })
+            .query_map_vec(
+                "SELECT id, configured_param, is_published FROM transports",
+                (),
+                |row| {
+                    let id: u32 = row.get(0)?;
+                    let json: String = row.get(1)?;
+                    let param = Self::from_json(&json)?;
+                    let is_published: bool = row.get(2)?;
+                    Ok((id, param, is_published))
+                },
+            )
             .await
     }
 
@@ -631,20 +636,16 @@ pub(crate) async fn sync_transports(
         modified |= save_transport(context, entered, configured, *timestamp, *is_published).await?;
     }
 
-    context
+    let reelected = context
         .sql
         .transaction(|transaction| {
-            let configured_addr = transaction.query_row(
-                "SELECT value FROM config WHERE keyname='configured_addr'",
-                (),
-                |row| {
-                    let addr: String = row.get(0)?;
-                    Ok(addr)
-                },
-            )?;
             for RemovedTransportData { addr, timestamp } in removed_transports {
-                if *addr == configured_addr {
-                    continue;
+                let count: i64 =
+                    transaction
+                        .query_row("SELECT COUNT(*) FROM transports", (), |row| row.get(0))?;
+                if count <= 1 {
+                    // Removing the last transport would unconfigure the account.
+                    break;
                 }
                 modified |= transaction.execute(
                     "DELETE FROM transports
@@ -660,22 +661,67 @@ pub(crate) async fn sync_transports(
                     (addr, timestamp),
                 )?;
             }
-            Ok(())
+
+            maybe_reelect_local_primary(transaction)
         })
         .await?;
 
+    if let Some(new_addr) = reelected {
+        info!(context, "Re-elected primary transport {new_addr:?}.");
+        context.sql.uncache_raw_config("configured_addr").await;
+        modified = true;
+    }
+
     if modified {
         context.self_public_key.lock().await.take();
-        tokio::task::spawn(restart_io_if_running_boxed(context.clone()));
+        context
+            .restart_io_after_fetch
+            .store(true, Ordering::Relaxed);
         context.emit_event(EventType::TransportsModified);
     }
     Ok(())
 }
 
-/// Same as `context.restart_io_if_running()`, but `Box::pin`ed and with a `+ Send` bound,
-/// so that it can be called recursively.
-fn restart_io_if_running_boxed(context: Context) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-    Box::pin(async move { context.restart_io_if_running().await })
+/// Elects a new primary transport for the device if the current one
+/// is not published or vanished, and there is a better candidate.
+///
+/// Returns the newly elected address if the primary transport changed.
+fn maybe_reelect_local_primary(transaction: &mut rusqlite::Transaction) -> Result<Option<String>> {
+    let configured_addr: String = transaction.query_row(
+        "SELECT value FROM config WHERE keyname='configured_addr'",
+        (),
+        |row| row.get(0),
+    )?;
+    // Newest transports first, they are the most likely to work.
+    let transports: Vec<(String, bool)> = transaction
+        .prepare(
+            "SELECT addr, is_published FROM transports
+             ORDER BY add_timestamp DESC, id DESC",
+        )?
+        .query_map((), |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    // Nothing to do if the current primary is still there and published.
+    if transports
+        .iter()
+        .any(|(addr, is_published)| *is_published && *addr == configured_addr)
+    {
+        return Ok(None);
+    }
+    // Take an unpublished transport only if nothing is published.
+    let published = transports.iter().find(|(_, is_published)| *is_published);
+    let Some((new_addr, _)) = published.or_else(|| transports.first()) else {
+        return Ok(None);
+    };
+    if *new_addr == configured_addr {
+        // The primary transport may be the only remaining one.
+        return Ok(None);
+    }
+    transaction.execute(
+        "UPDATE config SET value=? WHERE keyname='configured_addr'",
+        (new_addr,),
+    )?;
+    Ok(Some(new_addr.clone()))
 }
 
 /// Adds transport entry to the `transports` table with empty configuration.

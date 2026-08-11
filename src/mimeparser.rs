@@ -31,7 +31,8 @@ use crate::message::{self, Message, MsgId, Viewtype, get_vcard_summary, set_msg_
 use crate::param::{Param, Params};
 use crate::simplify::{SimplifiedText, simplify};
 use crate::sync::SyncItems;
-use crate::tools::{get_filemeta, parse_receive_headers, time, truncate_msg_text, validate_group_id};
+use crate::tools::{get_filemeta, parse_receive_headers, time, truncate_msg_text, validate_id};
+use crate::tools::validate_group_id;
 use crate::{chatlist_events, location, tools};
 
 /// Public key extracted from `Autocrypt-Gossip`
@@ -115,6 +116,10 @@ pub(crate) struct MimeMessage {
     pub(crate) group_avatar: Option<AvatarAction>,
     pub(crate) mdn_reports: Vec<Report>,
     pub(crate) delivery_report: Option<DeliveryReport>,
+
+    /// Parsed `Chat-Broadcast-States` header, if any:
+    /// accumulated reaction updates sent by a broadcast channel owner.
+    pub(crate) broadcast_reactions: Option<String>,
 
     /// Standard USENET signature, if any.
     ///
@@ -225,11 +230,11 @@ pub enum SystemMessage {
     /// which is sent by chatmail servers.
     InvalidUnencryptedMail = 13,
 
-    /// 1:1 chats info message telling that SecureJoin has started and the user should wait for it
+    /// Single chats info message telling that SecureJoin has started and the user should wait for it
     /// to complete.
     SecurejoinWait = 14,
 
-    /// 1:1 chats info message telling that SecureJoin is still running, but the user may already
+    /// Single chats info message telling that SecureJoin is still running, but the user may already
     /// send messages.
     SecurejoinWaitTimeout = 15,
 
@@ -259,6 +264,12 @@ pub enum SystemMessage {
 
     /// Group or broadcast channel description changed.
     GroupDescriptionChanged = 70,
+
+    /// Message pinned. The pinned message is referred in `In-Reply-To:` header.
+    MessagePinned = 71,
+
+    /// Message unpinned. The unpinned message is referred in `In-Reply-To:` header.
+    MessageUnpinned = 72,
 }
 
 impl MimeMessage {
@@ -657,6 +668,7 @@ impl MimeMessage {
             user_avatar: None,
             group_avatar: None,
             delivery_report: None,
+            broadcast_reactions: None,
             footer: None,
             is_mime_modified: false,
             decoded_data: Vec::new(),
@@ -736,6 +748,10 @@ impl MimeMessage {
                 self.is_system_message = SystemMessage::CallAccepted;
             } else if value == "call-ended" {
                 self.is_system_message = SystemMessage::CallEnded;
+            } else if value == "message-pinned" {
+                self.is_system_message = SystemMessage::MessagePinned;
+            } else if value == "message-unpinned" {
+                self.is_system_message = SystemMessage::MessageUnpinned;
             }
         } else if self.get_header(HeaderDef::ChatGroupMemberRemoved).is_some() {
             self.is_system_message = SystemMessage::MemberRemovedFromGroup;
@@ -791,6 +807,12 @@ impl MimeMessage {
                 part.param.set(Param::WebrtcHasVideoInitially, has_video);
             }
         }
+    }
+
+    fn parse_broadcast_reactions_header(&mut self) {
+        self.broadcast_reactions = self
+            .get_header(HeaderDef::ChatBroadcastStates)
+            .map(|s| s.to_string());
     }
 
     /// Squashes mutitpart chat messages with attachment into single-part messages.
@@ -873,6 +895,7 @@ impl MimeMessage {
         self.parse_system_message_headers();
         self.parse_avatar_headers(context)?;
         self.parse_videochat_headers();
+        self.parse_broadcast_reactions_header();
         if self.delivery_report.is_none() {
             self.squash_attachment_parts();
         }
@@ -1024,6 +1047,24 @@ impl MimeMessage {
     /// valid signature.
     pub fn was_encrypted(&self) -> bool {
         self.signature.is_some()
+    }
+
+    /// Returns the fingerprints of all keys distributed by this message:
+    /// - keys from Autocrypt-Gossip headers
+    /// - the key from the sender's Autocrypt header ("self-gossip")
+    ///
+    /// Nothing is returned unless the message was correctly encrypted.
+    pub(crate) fn distributed_key_fingerprints(&self) -> Vec<String> {
+        let sender_fingerprint = if self.was_encrypted() {
+            self.autocrypt_fingerprint.clone()
+        } else {
+            None
+        };
+        self.gossiped_keys
+            .values()
+            .map(|gossiped_key| gossiped_key.public_key.dc_fingerprint().hex())
+            .chain(sender_fingerprint)
+            .collect()
     }
 
     /// Returns whether the email contains a `chat-version` header.

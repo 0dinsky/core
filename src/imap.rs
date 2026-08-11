@@ -10,35 +10,32 @@ use std::{
     iter::Peekable,
     mem::take,
     str::FromStr,
-    sync::atomic::Ordering,
     time::{Duration, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, Result, bail, ensure, format_err};
 use async_channel::{self, Receiver, Sender};
-use async_imap::types::{Fetch, Flag, Name, NameAttribute, UnsolicitedResponse};
+use async_imap::types::{Fetch, Flag, UnsolicitedResponse};
 use futures::{FutureExt as _, TryStreamExt};
 use futures_lite::FutureExt;
 use ratelimit::Ratelimit;
 use url::Url;
 
-use crate::chat::{self, ChatIdBlocked, add_device_msg};
+use crate::chat::{self, add_device_msg};
 use crate::config::Config;
-use crate::constants::{Blocked, DC_VERSION_STR};
-use crate::contact::ContactId;
+use crate::constants::DC_VERSION_STR;
 use crate::context::Context;
 use crate::ensure_and_debug_assert;
 use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
-use crate::log::{LogExt, warn};
+use crate::log::LogExt;
+use crate::log::warn;
 use crate::message::{self, Message};
 use crate::mimeparser;
 use crate::net::proxy::ProxyConfig;
 use crate::net::session::SessionStream;
 use crate::push::encrypt_device_token;
-use crate::receive_imf::{
-    ReceivedMsg, from_field_to_contact_id, get_prefetch_parent_message, receive_imf_inner,
-};
+use crate::receive_imf::{ReceivedMsg, from_field_to_contact_id, receive_imf_inner};
 use crate::scheduler::connectivity::ConnectivityStore;
 use crate::stock_str;
 use crate::tools::{self, create_id, duration_to_str, time};
@@ -128,6 +125,11 @@ pub(crate) struct ServerMetadata {
     /// Maximum number of recipients for SMTP `RCPT TO:`.
     pub max_smtp_rcpt_to: Option<u32>,
 
+    /// True if we think the relay supports push notifications.
+    /// This gates wether we attempt to write an encrypted device token
+    /// to per-transport IMAP metadata key `/private/devicetoken`.
+    pub supports_push: bool,
+
     /// ICE servers for WebRTC calls.
     pub ice_servers: Vec<UnresolvedIceServer>,
 
@@ -138,24 +140,6 @@ pub(crate) struct ServerMetadata {
     /// should be fetched from the server
     /// to be ready for WebRTC calls.
     pub ice_servers_expiration_timestamp: i64,
-}
-
-#[derive(Debug, Display, PartialEq, Eq, Clone, Copy)]
-pub enum FolderMeaning {
-    Unknown,
-
-    /// Spam folder.
-    Spam,
-    Inbox,
-    Trash,
-
-    /// Virtual folders.
-    ///
-    /// On Gmail there are virtual folders marked as \\All, \\Important and \\Flagged.
-    /// Delta Chat ignores these folders because the same messages can be fetched
-    /// from the real folder and the result of moving and deleting messages via
-    /// virtual folder is unclear.
-    Virtual,
 }
 
 struct UidGrouper<T: Iterator<Item = (i64, u32, String)>> {
@@ -805,36 +789,16 @@ impl Imap {
 }
 
 impl Session {
-    /// Synchronizes UIDs for all folders.
-    pub(crate) async fn resync_folders(&mut self, context: &Context) -> Result<()> {
-        let all_folders = self
-            .list_folders()
-            .await
-            .context("listing folders for resync")?;
-        for folder in all_folders {
-            let folder_meaning = get_folder_meaning(&folder);
-            if !matches!(
-                folder_meaning,
-                FolderMeaning::Virtual | FolderMeaning::Unknown
-            ) {
-                self.resync_folder_uids(context, folder.name(), folder_meaning)
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
     /// Synchronizes UIDs in the database with UIDs on the server.
     ///
     /// It is assumed that no operations are taking place on the same
     /// folder at the moment. Make sure to run it in the same
     /// thread/task as other network operations on this folder to
     /// avoid race conditions.
-    pub(crate) async fn resync_folder_uids(
+    pub(crate) async fn resync_uids_with_server(
         &mut self,
         context: &Context,
         folder: &str,
-        folder_meaning: FolderMeaning,
     ) -> Result<()> {
         let uid_validity;
         // Collect pairs of UID and Message-ID.
@@ -858,25 +822,19 @@ impl Session {
                 let message_id = prefetch_get_message_id(&headers);
 
                 if let (Some(uid), Some(rfc724_mid)) = (fetch.uid, message_id) {
-                    msgs.insert(
-                        uid,
-                        (
-                            rfc724_mid,
-                            target_folder(context, folder, folder_meaning, &headers).await?,
-                        ),
-                    );
+                    msgs.insert(uid, rfc724_mid);
                 }
             }
 
             info!(
                 context,
-                "resync_folder_uids: Collected {} message IDs in {folder}.",
+                "resync_uids_with_server: Collected {} message IDs in {folder}.",
                 msgs.len(),
             );
 
             uid_validity = get_uidvalidity(context, transport_id, folder).await?;
         } else {
-            warn!(context, "resync_folder_uids: No folder {folder}.");
+            warn!(context, "resync_uids_with_server: No folder {folder}.");
             uid_validity = 0;
         }
 
@@ -885,16 +843,14 @@ impl Session {
             .sql
             .transaction(move |transaction| {
                 transaction.execute("DELETE FROM imap WHERE transport_id=? AND folder=?", (transport_id, folder,))?;
-                for (uid, (rfc724_mid, target)) in &msgs {
-                    // This may detect previously undetected moved
-                    // messages, so we update server_folder too.
+                for (uid, rfc724_mid) in &msgs {
                     transaction.execute(
                         "INSERT INTO imap (transport_id, rfc724_mid, folder, uid, uidvalidity, target)
                          VALUES           (?,            ?,          ?,      ?,   ?,           ?)
                          ON CONFLICT(transport_id, folder, uid, uidvalidity)
                          DO UPDATE SET rfc724_mid=excluded.rfc724_mid,
                                        target=excluded.target",
-                        (transport_id, rfc724_mid, folder, uid, uid_validity, target),
+                        (transport_id, rfc724_mid, folder, uid, uid_validity, folder),
                     )?;
                 }
                 Ok(())
@@ -1459,6 +1415,7 @@ impl Session {
                 admin,
                 iroh_relay,
                 max_smtp_rcpt_to,
+                supports_push: max_smtp_rcpt_to.is_some() || self.capabilities.has_xdeltapush,
                 ice_servers,
                 ice_servers_expiration_timestamp,
             },
@@ -1468,44 +1425,43 @@ impl Session {
 
     /// Stores device token into /private/devicetoken IMAP METADATA of the Inbox.
     pub(crate) async fn register_token(&mut self, context: &Context) -> Result<()> {
-        if context.push_subscribed.load(Ordering::Relaxed) {
+        // `update_metadata` ran before and computed `supports_push`.
+        if self.push_token_registered
+            || !context
+                .metadata
+                .read()
+                .await
+                .get(&self.transport_id())
+                .is_some_and(|metadata| metadata.supports_push)
+        {
             return Ok(());
         }
-
-        let transport_id = self.transport_id();
 
         let Some(device_token) = context.push_subscriber.device_token() else {
             return Ok(());
         };
 
-        if self.can_metadata() && self.can_push() {
-            info!(
-                context,
-                "Transport {transport_id}: Subscribing for push notifications."
-            );
+        let transport_id = self.transport_id();
 
-            let old_encrypted_device_token =
-                context.get_config(Config::EncryptedDeviceToken).await?;
+        info!(
+            context,
+            "Transport {transport_id}: Subscribing for push notifications."
+        );
 
-            // Whether we need to update encrypted device token.
-            let device_token_changed = old_encrypted_device_token.is_none()
-                || context.get_config(Config::DeviceToken).await?.as_ref() != Some(&device_token);
-
-            let new_encrypted_device_token;
-            if device_token_changed {
+        // Reuse the stored ciphertext if the token is unchanged:
+        // encryption gives a different result each time
+        // and the token must be sent byte-identical on every attempt
+        // so the server can deduplicate registrations.
+        let old_device_token = context.get_config(Config::DeviceToken).await?;
+        let encrypted_device_token = match context.get_config(Config::EncryptedDeviceToken).await? {
+            Some(old_encrypted_device_token)
+                if old_device_token.as_ref() == Some(&device_token) =>
+            {
+                old_encrypted_device_token
+            }
+            _ => {
                 let encrypted_device_token = encrypt_device_token(&device_token)
                     .context("Failed to encrypt device token")?;
-
-                // We expect that the server supporting `XDELTAPUSH` capability
-                // has non-synchronizing literals support as well:
-                // <https://www.rfc-editor.org/rfc/rfc7888>.
-                let encrypted_device_token_len = encrypted_device_token.len();
-
-                // Store device token saved on the server
-                // to prevent storing duplicate tokens.
-                // The server cannot deduplicate on its own
-                // because encryption gives a different
-                // result each time.
                 context
                     .set_config_internal(Config::DeviceToken, Some(&device_token))
                     .await?;
@@ -1515,49 +1471,47 @@ impl Session {
                         Some(&encrypted_device_token),
                     )
                     .await?;
-
-                if encrypted_device_token_len <= 4096 {
-                    new_encrypted_device_token = Some(encrypted_device_token);
-                } else {
-                    // If Apple or Google (FCM) gives us a very large token,
-                    // do not even try to give it to IMAP servers.
-                    //
-                    // Limit of 4096 is arbitrarily selected
-                    // to be the same as required by LITERAL- IMAP extension.
-                    //
-                    // Dovecot supports LITERAL+ and non-synchronizing literals
-                    // of any length, but there is no reason for tokens
-                    // to be that large even after OpenPGP encryption.
-                    warn!(context, "Device token is too long for LITERAL-, ignoring.");
-                    new_encrypted_device_token = None;
-                }
-            } else {
-                new_encrypted_device_token = old_encrypted_device_token;
+                encrypted_device_token
             }
+        };
 
-            // Store new encrypted device token on the server
-            // even if it is the same as the old one.
-            if let Some(encrypted_device_token) = new_encrypted_device_token {
-                self.run_command_and_check_ok(&format_setmetadata(
-                    "INBOX",
-                    &encrypted_device_token,
-                ))
-                .await
-                .context("SETMETADATA command failed")?;
+        // If the token cannot be stored we must not retry
+        // on every IMAP loop iteration / register_token invocation.
+        self.push_token_registered = true;
 
-                context.push_subscribed.store(true, Ordering::Relaxed);
-            }
+        // The token is sent as an IMAP quoted string
+        // (<https://www.rfc-editor.org/rfc/rfc3501#section-4.3>),
+        // which carries printable ASCII without double quotes or backslashes.
+        // The encrypted token is `openpgp:` followed by base64
+        // but let's guard against future changes
+        // rather than send a malformed or oversized command.
+        if encrypted_device_token.len() > 4096
+            || !encrypted_device_token
+                .bytes()
+                .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
+        {
+            warn!(
+                context,
+                "Device token cannot be stored as metadata, ignoring."
+            );
+            return Ok(());
+        }
+
+        // Store the encrypted device token on the server.
+        //
+        // Chatmail relays accept the token and forward it to notifications server
+        // when a new message arrives but other servers may reject or ignore the metadata entry.
+        let command =
+            format!("SETMETADATA \"INBOX\" (/private/devicetoken \"{encrypted_device_token}\")");
+        if let Err(err) = self.run_command_and_check_ok(&command).await {
+            warn!(
+                context,
+                "Transport {transport_id}: Failed to store device token: {err:#}."
+            );
         }
 
         Ok(())
     }
-}
-
-fn format_setmetadata(folder: &str, device_token: &str) -> String {
-    let device_token_len = device_token.len();
-    format!(
-        "SETMETADATA \"{folder}\" (/private/devicetoken {{{device_token_len}+}}\r\n{device_token})"
-    )
 }
 
 impl Session {
@@ -1640,204 +1594,6 @@ impl Session {
     }
 }
 
-async fn should_move_out_of_spam(
-    context: &Context,
-    headers: &[mailparse::MailHeader<'_>],
-) -> Result<bool> {
-    if headers.get_header_value(HeaderDef::ChatVersion).is_some() {
-        // If this is a chat message (i.e. has a ChatVersion header), then this might be
-        // a securejoin message. We can't find out at this point as we didn't prefetch
-        // the SecureJoin header. So, we always move chat messages out of Spam.
-        // Two possibilities to change this would be:
-        // 1. Remove the `&& !context.is_spam_folder(folder).await?` check from
-        // `fetch_new_messages()`, and then let `receive_imf()` check
-        // if it's a spam message and should be hidden.
-        // 2. Or add a flag to the ChatVersion header that this is a securejoin
-        // request, and return `true` here only if the message has this flag.
-        // `receive_imf()` can then check if the securejoin request is valid.
-        return Ok(true);
-    }
-
-    if let Some(msg) = get_prefetch_parent_message(context, headers).await? {
-        if msg.chat_blocked != Blocked::Not {
-            // Blocked or contact request message in the spam folder, leave it there.
-            return Ok(false);
-        }
-    } else {
-        let from = match mimeparser::get_from(headers) {
-            Some(f) => f,
-            None => return Ok(false),
-        };
-        // No chat found.
-        let (from_id, blocked_contact, _origin) =
-            match from_field_to_contact_id(context, &from, None, true, true)
-                .await
-                .context("from_field_to_contact_id")?
-            {
-                Some(res) => res,
-                None => {
-                    warn!(
-                        context,
-                        "Contact with From address {:?} cannot exist, not moving out of spam", from
-                    );
-                    return Ok(false);
-                }
-            };
-        if blocked_contact {
-            // Contact is blocked, leave the message in spam.
-            return Ok(false);
-        }
-
-        if let Some(chat_id_blocked) = ChatIdBlocked::lookup_by_contact(context, from_id).await? {
-            if chat_id_blocked.blocked != Blocked::Not {
-                return Ok(false);
-            }
-        } else if from_id != ContactId::SELF {
-            // No chat with this contact found.
-            return Ok(false);
-        }
-    }
-
-    Ok(true)
-}
-
-/// Returns target folder for a message found in the Spam folder.
-/// If this returns None, the message will not be moved out of the
-/// Spam folder, and as `fetch_new_messages()` doesn't download
-/// messages from the Spam folder, the message will be ignored.
-async fn spam_target_folder_cfg(
-    context: &Context,
-    headers: &[mailparse::MailHeader<'_>],
-) -> Result<Option<Config>> {
-    if !should_move_out_of_spam(context, headers).await? {
-        return Ok(None);
-    }
-
-    Ok(Some(Config::ConfiguredInboxFolder))
-}
-
-/// Returns `ConfiguredInboxFolder` or `ConfiguredMvboxFolder` if
-/// the message needs to be moved from `folder`. Otherwise returns `None`.
-pub async fn target_folder_cfg(
-    context: &Context,
-    folder: &str,
-    folder_meaning: FolderMeaning,
-    headers: &[mailparse::MailHeader<'_>],
-) -> Result<Option<Config>> {
-    if folder == "DeltaChat" {
-        return Ok(None);
-    }
-
-    if folder_meaning == FolderMeaning::Spam {
-        spam_target_folder_cfg(context, headers).await
-    } else {
-        Ok(None)
-    }
-}
-
-pub async fn target_folder(
-    context: &Context,
-    folder: &str,
-    folder_meaning: FolderMeaning,
-    headers: &[mailparse::MailHeader<'_>],
-) -> Result<String> {
-    match target_folder_cfg(context, folder, folder_meaning, headers).await? {
-        Some(config) => match context.get_config(config).await? {
-            Some(target) => Ok(target),
-            None => Ok(folder.to_string()),
-        },
-        None => Ok(folder.to_string()),
-    }
-}
-
-/// Try to get the folder meaning by the name of the folder only used if the server does not support XLIST.
-// TODO: lots languages missing - maybe there is a list somewhere on other MUAs?
-// however, if we fail to find out the sent-folder,
-// only watching this folder is not working. at least, this is no show stopper.
-// CAVE: if possible, take care not to add a name here that is "sent" in one language
-// but sth. different in others - a hard job.
-fn get_folder_meaning_by_name(folder_name: &str) -> FolderMeaning {
-    // source: <https://stackoverflow.com/questions/2185391/localized-gmail-imap-folders>
-    const SPAM_NAMES: &[&str] = &[
-        "spam",
-        "junk",
-        "Correio electrónico não solicitado",
-        "Correo basura",
-        "Lixo",
-        "Nettsøppel",
-        "Nevyžádaná pošta",
-        "No solicitado",
-        "Ongewenst",
-        "Posta indesiderata",
-        "Skräp",
-        "Wiadomości-śmieci",
-        "Önemsiz",
-        "Ανεπιθύμητα",
-        "Спам",
-        "垃圾邮件",
-        "垃圾郵件",
-        "迷惑メール",
-        "스팸",
-    ];
-    const TRASH_NAMES: &[&str] = &[
-        "Trash",
-        "Bin",
-        "Caixote do lixo",
-        "Cestino",
-        "Corbeille",
-        "Papelera",
-        "Papierkorb",
-        "Papirkurv",
-        "Papperskorgen",
-        "Prullenbak",
-        "Rubujo",
-        "Κάδος απορριμμάτων",
-        "Корзина",
-        "Кошик",
-        "ゴミ箱",
-        "垃圾桶",
-        "已删除邮件",
-        "휴지통",
-    ];
-    let lower = folder_name.to_lowercase();
-
-    if lower == "inbox" {
-        FolderMeaning::Inbox
-    } else if SPAM_NAMES.iter().any(|s| s.to_lowercase() == lower) {
-        FolderMeaning::Spam
-    } else if TRASH_NAMES.iter().any(|s| s.to_lowercase() == lower) {
-        FolderMeaning::Trash
-    } else {
-        FolderMeaning::Unknown
-    }
-}
-
-fn get_folder_meaning_by_attrs(folder_attrs: &[NameAttribute]) -> FolderMeaning {
-    for attr in folder_attrs {
-        match attr {
-            NameAttribute::Trash => return FolderMeaning::Trash,
-            NameAttribute::Junk => return FolderMeaning::Spam,
-            NameAttribute::All | NameAttribute::Flagged => return FolderMeaning::Virtual,
-            NameAttribute::Extension(label) => {
-                match label.as_ref() {
-                    "\\Spam" => return FolderMeaning::Spam,
-                    "\\Important" => return FolderMeaning::Virtual,
-                    _ => {}
-                };
-            }
-            _ => {}
-        }
-    }
-    FolderMeaning::Unknown
-}
-
-pub(crate) fn get_folder_meaning(folder: &Name) -> FolderMeaning {
-    match get_folder_meaning_by_attrs(folder.attributes()) {
-        FolderMeaning::Unknown => get_folder_meaning_by_name(folder.name()),
-        meaning => meaning,
-    }
-}
-
 /// Parses the headers from the FETCH result.
 fn get_fetch_headers(prefetch_msg: &Fetch) -> Result<Vec<mailparse::MailHeader<'_>>> {
     match prefetch_msg.header() {
@@ -1867,7 +1623,7 @@ pub(crate) async fn prefetch_should_download(
     message_id: &str,
     mut flags: impl Iterator<Item = Flag<'_>>,
 ) -> Result<bool> {
-    if message::rfc724_mid_download_tried(context, message_id).await? {
+    if message::rfc724_mid_fetch_tried(context, message_id).await? {
         if let Some(from) = mimeparser::get_from(headers)
             && context.is_self_addr(&from.addr).await?
         {

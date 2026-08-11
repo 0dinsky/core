@@ -275,7 +275,7 @@ def test_chat(acfactory) -> None:
     bob_chat_alice.unpin()
     bob_chat_alice.archive()
     bob_chat_alice.unarchive()
-    with pytest.raises(JsonRpcError):  # can't set name for 1:1 chats
+    with pytest.raises(JsonRpcError):  # can't set name for single chats
         bob_chat_alice.set_name("test")
     bob_chat_alice.set_ephemeral_timer(300)
     bob_chat_alice.get_encryption_info()
@@ -1002,6 +1002,11 @@ def test_no_markseen_in_team_profile(team_profile, acfactory):
     assert message2.get_snapshot().state == MessageState.IN_FRESH
 
     message.mark_seen()
+
+    # The MDN is queued in `smtp_mdns`, which is drained only after the regular
+    # `smtp` queue, so "Outgoing message" would otherwise overtake it on the wire.
+    # Wait for the read receipt to reach Alice before queueing "Outgoing message".
+    alice.wait_for_event(EventType.MSG_READ)
 
     # Send a message and wait until it arrives
     # in order to wait until Bob2 gets the markseen message.

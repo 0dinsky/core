@@ -152,6 +152,20 @@ async fn test_get_contacts() -> Result<()> {
     assert_eq!(contacts.len(), 1);
     let contacts = Contact::get_all(&context, 0, Some("δ")).await?;
     assert_eq!(contacts.len(), 1);
+
+    // Searching for a secondary self address finds "Me",
+    // even if the transport is unpublished.
+    crate::transport::add_pseudo_transport(&context, "bob@second.example").await?;
+    context
+        .set_transport_unpublished("bob@second.example", true)
+        .await?;
+    let contacts = Contact::get_all(
+        &context,
+        constants::DC_GCL_ADD_SELF,
+        Some("bob@second.example"),
+    )
+    .await?;
+    assert_eq!(contacts, vec![ContactId::SELF]);
     Ok(())
 }
 
@@ -162,7 +176,7 @@ async fn test_search_contacts_from_group() -> Result<()> {
     let bob = &tcm.bob().await;
     let fiona = &tcm.fiona().await;
 
-    let alice_chat_id = chat::create_group(alice, "").await?;
+    let alice_chat_id = chat::create_group(alice, "group").await?;
     let qr = get_securejoin_qr(alice, Some(alice_chat_id)).await?;
     let bob_chat_id = tcm.exec_securejoin_qr(bob, alice, &qr).await;
     tcm.exec_securejoin_qr(fiona, alice, &qr).await;
@@ -224,6 +238,7 @@ async fn test_add_or_lookup() {
         "\nWonderland, Alice <alice@w.de>\n",
     );
     assert_eq!(Contact::add_address_book(&t, book).await.unwrap(), 4);
+    t.assert_warn(r#"invalid address "+1234567890""#).await;
 
     // check first added contact, this modifies authname because it is empty
     let (contact_id, sth_modified) = Contact::add_or_lookup(
@@ -337,7 +352,7 @@ async fn test_contact_name_changes() -> Result<()> {
     let t = TestContext::new_alice().await;
     t.allow_unencrypted().await?;
 
-    // first message creates contact and one-to-one-chat without name set
+    // first message creates contact and single-chat without name set
     receive_imf(
         &t,
         b"From: f@example.org\n\
@@ -1081,6 +1096,11 @@ async fn test_was_seen_recently_event() -> Result<()> {
             .get_matching(|evt| matches!(evt, EventType::ContactsChanged { .. }))
             .await;
     }
+    // this warning is only printed when `RecentlySeenLoop` is dropped,
+    // so we can't assert it otherwise.
+    drop(recently_seen_loop);
+    bob.assert_warn("receiving from an empty and closed channel")
+        .await;
     Ok(())
 }
 

@@ -192,7 +192,9 @@ pub enum Config {
     #[strum(props(default = "0"))]
     DeleteDeviceAfter,
 
-    /// The primary email address.
+    /// The primary email address, used for sending and background fetch.
+    ///
+    /// Device-local, other devices keep their own primary transport.
     ConfiguredAddr,
 
     /// Deprecated(2026-04).
@@ -346,8 +348,20 @@ pub enum Config {
     /// Timestamp of the last time housekeeping was run
     LastHousekeeping,
 
+    /// Timestamp of the last time accumulated broadcast channel reactions were sent
+    LastReactionsBroadcast,
+
     /// Timestamp of the last `CantDecryptOutgoingMsgs` notification.
     LastCantDecryptOutgoingMsgs,
+
+    /// Timestamp of the last time automatic relay management was run
+    LastAutomaticRelayManagement,
+
+    /// Whether to automatically add/remove transports
+    AutomaticRelayManagement,
+
+    /// Whether automatic relay management successfully added the desired number of relays
+    AutomaticRelayManagementFinished,
 
     /// Whether to avoid using IMAP IDLE even if the server supports it.
     ///
@@ -776,35 +790,38 @@ impl Context {
                                 (addr,),
                             )?;
 
-                            // Update the timestamp for the primary transport
-                            // so it becomes the first in `get_all_self_addrs()` list
-                            // and the list of relays distributed in the public key.
-                            // This ensures that messages will be sent
-                            // to the primary relay by the contacts
-                            // and will be fetched in background_fetch()
-                            // which only fetches from the primary transport.
+                            // `is_published=1`: an unpublished primary would be missing
+                            // from the relay list in the public key, so contacts would
+                            // never send to it.
+                            //
+                            // The timestamp must strictly increase because
+                            // other devices ignore the row update otherwise,
+                            // and contacts only adopt the re-signed key
+                            // if its signature timestamp increases.
                             transaction
                                 .execute(
-                                    "UPDATE transports SET add_timestamp=?, is_published=1 WHERE addr=?",
+                                    "UPDATE transports
+                                     SET add_timestamp=MAX(?, add_timestamp+1), is_published=1
+                                     WHERE addr=?",
                                     (time(), addr),
                                 )
                                 .context(
                                     "Failed to update add_timestamp for the new primary transport",
                                 )?;
 
-                            // Clean up SMTP and IMAP APPEND queue.
+                            // Clean up SMTP queue.
                             //
                             // The messages in the queue have a different
                             // From address so we cannot send them over
                             // the new SMTP transport.
                             transaction.execute("DELETE FROM smtp", ())?;
-                            transaction.execute("DELETE FROM imap_send", ())?;
 
                             Ok(())
                         })
                         .await?;
-                    send_sync_transports(self).await?;
+                    // Invalidate the cache so the sync message cannot read a stale primary address.
                     self.sql.uncache_raw_config("configured_addr").await;
+                    send_sync_transports(self).await?;
                 }
             }
             _ => {

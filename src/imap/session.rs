@@ -49,6 +49,10 @@ pub(crate) struct Session {
     /// Should be false if no folder is currently selected.
     pub new_mail: bool,
 
+    /// True if storing the device token on the relay
+    /// was already attempted on this connection.
+    pub(crate) push_token_registered: bool,
+
     pub resync_request_sender: async_channel::Sender<()>,
 }
 
@@ -81,6 +85,7 @@ impl Session {
             selected_mailbox: None,
             selected_folder_needs_expunge: false,
             new_mail: false,
+            push_token_registered: false,
             resync_request_sender,
         }
     }
@@ -106,19 +111,9 @@ impl Session {
         self.capabilities.can_metadata
     }
 
-    pub fn can_push(&self) -> bool {
-        self.capabilities.can_push
-    }
-
     // Returns true if IMAP server has `XCHATMAIL` capability.
     pub(crate) fn is_chatmail(&self) -> bool {
         self.capabilities.is_chatmail
-    }
-
-    /// Returns the names of all folders on the IMAP server.
-    pub async fn list_folders(&mut self) -> Result<Vec<async_imap::types::Name>> {
-        let list = self.list(Some(""), Some("*")).await?.try_collect().await?;
-        Ok(list)
     }
 
     /// Prefetch `n_uids` messages starting from `uid_next`. Returns a list of fetch results in the
