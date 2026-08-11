@@ -356,6 +356,40 @@ pub unsafe extern "C" fn dc_get_info(context: *const dc_context_t) -> *mut libc:
     }
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dc_rotate_keypair_now(context: *mut dc_context_t) -> libc::c_int {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_rotate_keypair_now()");
+        return 0;
+    }
+    let ctx = unsafe { &*context };
+    match block_on(deltachat::key::rotate_keypair_now(ctx))
+        .context("Failed to rotate keypair")
+        .log_err(ctx)
+    {
+        Ok(()) => 1,
+        Err(_) => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dc_get_self_encryption_kind(
+    context: *const dc_context_t,
+) -> *mut libc::c_char {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_get_self_encryption_kind()");
+        return "".strdup();
+    }
+    let ctx = unsafe { &*context };
+    match block_on(deltachat::key::get_self_encryption_kind(ctx))
+        .context("Failed to get self encryption kind")
+        .log_err(ctx)
+    {
+        Ok(s) => s.strdup(),
+        Err(_) => "".strdup(),
+    }
+}
+
 fn render_info(
     info: BTreeMap<&'static str, String>,
 ) -> std::result::Result<String, std::fmt::Error> {

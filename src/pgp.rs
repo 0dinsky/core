@@ -358,6 +358,131 @@ pub fn has_pq_encryption_subkey(key: &SignedSecretKey) -> bool {
 }
 
 
+/// Build a throwaway keypair whose single purpose is to donate a fresh
+/// encryption subkey of the requested family, version-aligned with `version`
+/// so it can be re-bound onto an existing primary of that version.
+fn create_encryption_subkey_donor(
+    addr: EmailAddress,
+    use_pq_encryption: bool,
+    version: KeyVersion,
+) -> Result<SignedSecretKey> {
+    // Primary is only a vehicle for generating/signing the subkey; match the
+    // parent version so the subkey packet version is compatible.
+    let (primary_type, enc_type) = if use_pq_encryption {
+        // ML-KEM-768+X25519 works as V4 or V6 encryption subkey.
+        // For the temp primary use Ed25519 (V4/V6) — not ML-DSA (V6-only),
+        // so this also works when attaching a PQ subkey to a classic V4 primary.
+        let primary = if version >= KeyVersion::V6 {
+            PgpKeyType::Ed25519
+        } else {
+            PgpKeyType::Ed25519Legacy
+        };
+        (primary, PgpKeyType::MlKem768X25519)
+    } else if version >= KeyVersion::V6 {
+        (PgpKeyType::Ed25519, PgpKeyType::X25519)
+    } else {
+        (
+            PgpKeyType::Ed25519Legacy,
+            PgpKeyType::ECDH(ECCCurve::Curve25519Legacy),
+        )
+    };
+
+    let key_params = SecretKeyParamsBuilder::default()
+        .version(version)
+        .key_type(primary_type)
+        .can_certify(true)
+        .can_sign(true)
+        .primary_user_id(format!("<{addr}>"))
+        .passphrase(None)
+        .subkey(
+            SubkeyParamsBuilder::default()
+                .version(version)
+                .key_type(enc_type)
+                .can_encrypt(EncryptionCaps::All)
+                .passphrase(None)
+                .build()
+                .context("failed to build donor subkey parameters")?,
+        )
+        .build()
+        .context("failed to build donor key parameters")?;
+
+    let mut rng = thread_rng();
+    let secret_key = key_params
+        .generate(&mut rng)
+        .context("Failed to generate donor keypair for encryption subkey rotation")?;
+    Ok(secret_key)
+}
+
+/// Rotates **only the encryption subkey**, keeping the primary key (and thus
+/// the OpenPGP fingerprint) unchanged.
+///
+/// This preserves "Verified" status for contacts who already verified us:
+/// their stored fingerprint still matches our primary key.
+///
+/// Old encryption subkey material remains on the returned key as an additional
+/// subkey so in-flight messages encrypted to the old subkey can still be
+/// decrypted until the key is eventually replaced entirely.
+pub fn rotate_encryption_subkey(
+    existing: &SignedSecretKey,
+    addr: EmailAddress,
+    use_pq_encryption: bool,
+) -> Result<SignedSecretKey> {
+    use pgp::composed::SignedSecretSubKey;
+    use pgp::packet::KeyFlags;
+
+    // Generate a temporary keypair solely to obtain a fresh encryption subkey
+    // of the desired algorithm family. The temp primary version must match the
+    // existing primary: V4 primary cannot bind a V6 subkey (and vice versa).
+    // ML-KEM-768+X25519 is allowed as a V4 encryption subkey; ML-DSA primary
+    // is V6-only (full PQ keypairs go through create_pqc_keypair instead).
+    let parent_version = existing.primary_key.version();
+    let temp = create_encryption_subkey_donor(addr, use_pq_encryption, parent_version)?;
+    let new_sub_key = temp
+        .secret_subkeys
+        .into_iter()
+        .next()
+        .context("temporary keypair has no encryption subkey")?;
+
+    let mut rng = thread_rng();
+    let mut keyflags = KeyFlags::default();
+    // Mark as encryption-capable (storage + communications).
+    keyflags.set_encrypt_comms(true);
+    keyflags.set_encrypt_storage(true);
+
+    let binding_sig = new_sub_key.key.sign(
+        &mut rng,
+        &existing.primary_key,
+        existing.primary_key.public_key(),
+        &Password::empty(),
+        keyflags,
+        None,
+    )?;
+
+    let new_signed_sub = SignedSecretSubKey::new(new_sub_key.key, vec![binding_sig]);
+    let new_pub_sub = SignedPublicSubKey {
+        key: new_signed_sub.public_key().clone(),
+        signatures: new_signed_sub.signatures.clone(),
+    };
+
+    // New encryption subkey first (preferred); keep old subkeys for decryption.
+    let mut secret_subkeys = vec![new_signed_sub];
+    secret_subkeys.extend(existing.secret_subkeys.clone());
+    let mut public_subkeys = vec![new_pub_sub];
+    public_subkeys.extend(existing.public_subkeys.clone());
+
+    let rotated = SignedSecretKey {
+        primary_key: existing.primary_key.clone(),
+        details: existing.details.clone(),
+        public_subkeys,
+        secret_subkeys,
+    };
+    rotated
+        .verify_bindings()
+        .context("rotated key failed binding verification")?;
+    Ok(rotated)
+}
+
+
 /// Version of SEIPD packet to use.
 ///
 /// See

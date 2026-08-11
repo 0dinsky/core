@@ -587,6 +587,19 @@ int             dc_set_config_from_qr   (dc_context_t* context, const char* qr);
  */
 char*           dc_get_info                  (const dc_context_t* context);
 
+/**
+ * Rotate the encryption subkey according to current key_gen_mode (0=classic, 1=post-quantum).
+ * Primary fingerprint is preserved.
+ * @return 1 on success, 0 on failure.
+ */
+int             dc_rotate_keypair_now        (dc_context_t* context);
+
+/**
+ * Returns "classic", "pq", or "" for the account's current encryption key.
+ * Must be released with dc_str_unref().
+ */
+char*           dc_get_self_encryption_kind  (const dc_context_t* context);
+
 
 
 

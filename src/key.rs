@@ -661,6 +661,51 @@ impl std::str::FromStr for Fingerprint {
     }
 }
 
+
+/// Immediately generates a fresh encryption subkey matching current
+/// [`Config::KeyGenMode`] and stores it as the active self key.
+/// Primary fingerprint is preserved.
+pub async fn rotate_keypair_now(context: &Context) -> Result<()> {
+    let key_gen_mode = context.get_config_int(Config::KeyGenMode).await?;
+    let addr = context.get_primary_self_addr().await?;
+    let addr = EmailAddress::new(&addr)?;
+    let existing = load_self_secret_key(context).await?;
+    let use_pq = key_gen_mode == 1;
+    info!(
+        context,
+        "Rotating encryption subkey (key_gen_mode={key_gen_mode})."
+    );
+    let new_key = tokio::task::spawn_blocking(move || {
+        crate::pgp::rotate_encryption_subkey(&existing, addr, use_pq)
+    })
+    .await??;
+
+    let public_key = DcKey::to_bytes(&new_key.to_public_key());
+    let secret_key = DcKey::to_bytes(&new_key);
+    context
+        .sql
+        .execute(
+            "UPDATE keypairs SET public_key=?, private_key=?
+             WHERE id=(SELECT CAST(value AS INTEGER) FROM config WHERE keyname='key_id')",
+            (&public_key, &secret_key),
+        )
+        .await?;
+    *context.self_public_key.lock().await = None;
+    Ok(())
+}
+
+/// Returns "classic", "pq", or "" for this account's current encryption key.
+pub async fn get_self_encryption_kind(context: &Context) -> Result<String> {
+    let Some(key) = load_keypair(context).await? else {
+        return Ok(String::new());
+    };
+    Ok(
+        crate::pgp::encryption_kind_secret(&key)
+            .map(|k| k.as_param_str().to_string())
+            .unwrap_or_default(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, LazyLock};
