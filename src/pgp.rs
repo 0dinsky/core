@@ -15,14 +15,14 @@ use pgp::crypto::ecc_curve::ECCCurve;
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::packet::{Signature, Subpacket, SubpacketData};
+use pgp::crypto::public_key::PublicKeyAlgorithm;
 use pgp::types::{
     CompressionAlgorithm, Imprint, KeyDetails, KeyVersion, Password, SignedUser, SigningKey as _,
-    StringToKey, Timestamp, PublicKeyAlgorithm,
+    StringToKey,
 };
 use rand_old::{Rng as _, thread_rng};
 use sha2::Sha256;
 use smallvec::smallvec;
-use tokio::runtime::Handle;
 
 use crate::configure::MAX_RELAYS;
 use crate::key::{DcKey, Fingerprint};
