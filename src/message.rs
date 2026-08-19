@@ -1627,7 +1627,7 @@ pub(crate) fn guess_msgtype_from_path_suffix(path: &Path) -> Option<(Viewtype, &
         "wav" => (Viewtype::Audio, "audio/wav"),
         "weba" => (Viewtype::File, "audio/webm"),
         "webm" => (Viewtype::Video, "video/webm"),
-        "webp" => (Viewtype::Sticker, "image/webp"), // iOS via SDWebImage, Android since 4.0
+        "webp" => (Viewtype::Image, "image/webp"), // iOS via SDWebImage, Android since 4.0
         "wmv" => (Viewtype::Video, "video/x-ms-wmv"),
         "xdc" => (Viewtype::Webxdc, "application/webxdc+zip"),
         "xhtml" => (Viewtype::File, "application/xhtml+xml"),
