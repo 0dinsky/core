@@ -11,7 +11,7 @@ use crate::constants::{
 use crate::ephemeral::Timer;
 use crate::headerdef::HeaderDef;
 use crate::imex::{ImexMode, has_backup, imex};
-use crate::message::{Message, MessengerMessage, delete_msgs};
+use crate::message::{Message, delete_msgs};
 use crate::mimeparser::{self, MimeMessage};
 use crate::pinned_messages::{get_pinned_messages, set_pinned_state};
 use crate::qr::{Qr, check_qr};
@@ -306,7 +306,7 @@ async fn test_add_contact_to_chat_ex_add_self() {
     // Adding self to a contact should succeed, even though it's pointless.
     let t = TestContext::new_alice().await;
     let chat_id = create_group(&t, "foo").await.unwrap();
-    let added = add_contact_to_chat_ex(&t, Nosync, chat_id, ContactId::SELF, false)
+    let added = add_contact_to_chat_ext(&t, Nosync, chat_id, ContactId::SELF, false)
         .await
         .unwrap();
     assert_eq!(added, false);
@@ -387,7 +387,7 @@ async fn test_member_add_remove() -> Result<()> {
     let sent = alice.pop_sent_msg().await;
     assert_eq!(
         sent.load_from_db().await.get_text(),
-        stock_str::msg_group_left_local(&alice, ContactId::SELF).await
+        stock_str::msg_del_member_local(&alice, ContactId::SELF, ContactId::SELF).await
     );
 
     Ok(())
@@ -449,7 +449,7 @@ async fn test_parallel_member_remove() -> Result<()> {
     // Test that remove message is rewritten.
     assert_eq!(
         bob_received_remove_msg.get_text(),
-        "Member Me removed by alice@example.org."
+        "You were removed by alice@example.org."
     );
 
     Ok(())
@@ -791,7 +791,7 @@ async fn test_add_remove_contact_for_single() {
 
     // adding or removing contacts from single chats result in an error
     let claire = Contact::create(&ctx, "", "claire@foo.de").await.unwrap();
-    let added = add_contact_to_chat_ex(&ctx, Nosync, chat.id, claire, false).await;
+    let added = add_contact_to_chat_ext(&ctx, Nosync, chat.id, claire, false).await;
     assert!(added.is_err());
     assert_eq!(get_chat_contacts(&ctx, chat.id).await.unwrap().len(), 1);
 
@@ -2457,7 +2457,6 @@ async fn test_save_msgs() -> Result<()> {
     );
     assert_eq!(saved_msg.get_text(), "hi, bob");
     assert!(!saved_msg.is_forwarded()); // UI should not flag "saved messages" as "forwarded"
-    assert_eq!(saved_msg.is_dc_message, MessengerMessage::Yes);
     assert_eq!(saved_msg.get_from_id(), ContactId::SELF);
     assert_eq!(saved_msg.get_state(), MessageState::OutDelivered);
     assert_ne!(saved_msg.rfc724_mid(), sent_msg.rfc724_mid());
@@ -2482,7 +2481,6 @@ async fn test_save_msgs() -> Result<()> {
     );
     assert_eq!(saved_msg.get_text(), "hi, bob");
     assert!(!saved_msg.is_forwarded());
-    assert_eq!(saved_msg.is_dc_message, MessengerMessage::Yes);
     assert_ne!(saved_msg.get_from_id(), ContactId::SELF);
     assert_eq!(saved_msg.get_state(), MessageState::InSeen);
     assert_ne!(saved_msg.rfc724_mid(), rcvd_msg.rfc724_mid());
@@ -3193,7 +3191,7 @@ async fn test_broadcast_resend_to_new_member() -> Result<()> {
     }
     for i in 0..N_MSGS_TO_NEW_BROADCAST_MEMBER {
         let rev_order = false;
-        let resent_msg = alice.pop_sent_msg_ex(rev_order).await.unwrap();
+        let resent_msg = alice.pop_sent_msg_ext(rev_order).await.unwrap();
         let fiona_msg = fiona.recv_msg(&resent_msg).await;
         assert_eq!(fiona_msg.chat_id, fiona_bc_id);
         assert_eq!(fiona_msg.text, (i + 1).to_string());
@@ -4002,7 +4000,7 @@ async fn test_remove_member_from_broadcast() -> Result<()> {
 
     let remove_msg = alice.pop_sent_msg().await;
     let rcvd = bob.recv_msg(&remove_msg).await;
-    assert_eq!(rcvd.text, "Member Me removed by alice@example.org.");
+    assert_eq!(rcvd.text, "You were removed by alice@example.org.");
 
     let bob_chat = Chat::load_from_db(bob, bob_chat_id).await?;
     assert_eq!(bob_chat.is_self_in_chat(bob).await?, false);
@@ -4293,7 +4291,7 @@ async fn test_encrypt_decrypt_broadcast() -> Result<()> {
     let bob_alice_contact_id = bob.add_or_lookup_contact_id(alice).await;
 
     tcm.section("Create a broadcast channel with Bob, and send a message");
-    let alice_chat_id = create_out_broadcast_ex(
+    let alice_chat_id = create_out_broadcast_ext(
         alice,
         Sync,
         "My Channel".to_string(),
@@ -6189,7 +6187,7 @@ async fn test_send_delete_request() -> Result<()> {
     let alice_msg = sent1.load_from_db().await;
     assert_eq!(alice_chat.id.get_msg_cnt(alice).await?, E2EE_INFO_MSGS + 2);
 
-    message::delete_msgs_ex(alice, &[alice_msg.id], true).await?;
+    message::delete_msgs_ext(alice, &[alice_msg.id], true).await?;
     let sent2 = alice.pop_sent_msg().await;
     assert_eq!(alice_chat.id.get_msg_cnt(alice).await?, E2EE_INFO_MSGS + 1);
 
@@ -6236,7 +6234,7 @@ async fn test_send_delete_request_no_encryption() -> Result<()> {
     // Alice sends a message, then tries to send a deletion request which fails.
     let sent1 = alice.send_text(alice_chat.id, "wtf").await;
     assert!(
-        message::delete_msgs_ex(alice, &[sent1.sender_msg_id], true)
+        message::delete_msgs_ext(alice, &[sent1.sender_msg_id], true)
             .await
             .is_err()
     );

@@ -29,26 +29,26 @@ enum SetupContactCase {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_setup_contact_basic() {
-    test_setup_contact_ex(SetupContactCase::Normal).await;
+    test_setup_contact_ext(SetupContactCase::Normal).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_setup_contact_wrong_alice_gossip() {
-    let (alice, _) = test_setup_contact_ex(SetupContactCase::WrongAliceGossip).await;
+    let (alice, _) = test_setup_contact_ext(SetupContactCase::WrongAliceGossip).await;
     alice.assert_warn("No self addr+pubkey gossip found").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_setup_contact_alice_is_bot() {
-    test_setup_contact_ex(SetupContactCase::AliceIsBot).await;
+    test_setup_contact_ext(SetupContactCase::AliceIsBot).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_setup_contact_alice_has_name() {
-    test_setup_contact_ex(SetupContactCase::AliceHasName).await;
+    test_setup_contact_ext(SetupContactCase::AliceHasName).await;
 }
 
-async fn test_setup_contact_ex(case: SetupContactCase) -> (TestContext, TestContext) {
+async fn test_setup_contact_ext(case: SetupContactCase) -> (TestContext, TestContext) {
     let _n = TimeShiftFalsePositiveNote;
 
     let mut tcm = TestContextManager::new();
@@ -64,13 +64,12 @@ async fn test_setup_contact_ex(case: SetupContactCase) -> (TestContext, TestCont
     bob.set_config(Config::Displayname, Some("Bob Examplenet"))
         .await
         .unwrap();
-    let alice_auto_submitted_hdr: bool;
-    match case {
+    let alice_auto_submitted_hdr = match case {
         SetupContactCase::AliceIsBot => {
             alice.set_config_bool(Config::Bot, true).await.unwrap();
-            alice_auto_submitted_hdr = true;
+            true
         }
-        _ => alice_auto_submitted_hdr = false,
+        _ => false,
     };
 
     assert_eq!(
@@ -450,18 +449,18 @@ async fn test_setup_contact_concurrent_calls() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_secure_join_group_legacy() -> Result<()> {
-    test_secure_join_group_ex(false, false).await
+    test_secure_join_group_ext(false, false).await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_secure_join_group_v3() -> Result<()> {
-    test_secure_join_group_ex(true, false).await
+    test_secure_join_group_ext(true, false).await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_secure_join_group_v3_without_invite() -> Result<()> {
-    test_secure_join_group_ex(true, true).await
+    test_secure_join_group_ext(true, true).await
 }
 
-async fn test_secure_join_group_ex(v3: bool, remove_invite: bool) -> Result<()> {
+async fn test_secure_join_group_ext(v3: bool, remove_invite: bool) -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = tcm.alice().await;
     let bob = tcm.bob().await;
@@ -689,18 +688,18 @@ async fn test_secure_join_group_ex(v3: bool, remove_invite: bool) -> Result<()> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_secure_join_broadcast_legacy() -> Result<()> {
-    test_secure_join_broadcast_ex(false, false).await
+    test_secure_join_broadcast_ext(false, false).await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_secure_join_broadcast_v3() -> Result<()> {
-    test_secure_join_broadcast_ex(true, false).await
+    test_secure_join_broadcast_ext(true, false).await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_secure_join_broadcast_v3_without_invite() -> Result<()> {
-    test_secure_join_broadcast_ex(true, true).await
+    test_secure_join_broadcast_ext(true, true).await
 }
 
-async fn test_secure_join_broadcast_ex(v3: bool, remove_invite: bool) -> Result<()> {
+async fn test_secure_join_broadcast_ext(v3: bool, remove_invite: bool) -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
@@ -721,18 +720,18 @@ async fn test_secure_join_broadcast_ex(v3: bool, remove_invite: bool) -> Result<
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_setup_contact_compatibility_legacy() -> Result<()> {
-    test_setup_contact_compatibility_ex(false, false).await
+    test_setup_contact_compatibility_ext(false, false).await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_setup_contact_compatibility_v3() -> Result<()> {
-    test_setup_contact_compatibility_ex(true, false).await
+    test_setup_contact_compatibility_ext(true, false).await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_setup_contact_compatibility_v3_without_invite() -> Result<()> {
-    test_setup_contact_compatibility_ex(true, true).await
+    test_setup_contact_compatibility_ext(true, true).await
 }
 
-async fn test_setup_contact_compatibility_ex(v3: bool, remove_invite: bool) -> Result<()> {
+async fn test_setup_contact_compatibility_ext(v3: bool, remove_invite: bool) -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
@@ -1651,7 +1650,7 @@ async fn test_deduplicate_member_added() -> Result<()> {
 
     let bob_rcvd = bob.recv_msg(&sent1).await;
     assert_eq!(bob_rcvd.chat_id, bob_chat_id);
-    assert_eq!(bob_rcvd.text, "Member Me added by alice@example.org.");
+    assert_eq!(bob_rcvd.text, "You were added by alice@example.org.");
 
     // Second message is a no-op, so it is trashed.
     bob.recv_msg_trash(&sent2).await;

@@ -7,8 +7,11 @@ import os
 import pathlib
 import platform
 import random
+import socket
 import subprocess
 import sys
+import time
+import urllib.parse
 from typing import AsyncGenerator, Optional
 
 import pytest
@@ -24,16 +27,39 @@ Currently this is "Messages are end-to-end encrypted."
 """
 
 
+def pytest_configure(config):
+    # Run only in the xdist controller, before the workers exist.
+    if not hasattr(config, "workerinput"):
+        domain = os.environ.get("CHATMAIL_DOMAIN")
+        if domain:
+            check_chatmail_domain_and_warmup_dns_cache(domain)
+
+
+def check_chatmail_domain_and_warmup_dns_cache(domain):
+    for i in range(6):
+        try:
+            socket.getaddrinfo(domain, 443)
+            return
+        except socket.gaierror as e:
+            error = e
+            logging.warning(f"DNS resolution of {domain} failed (attempt {i}): {e}")
+            time.sleep(10)
+
+    pytest.exit(f"cannot resolve chatmail relay domain {domain}: {error}")
+
+
 def pytest_report_header():
+    headers = [f"CHATMAIL_DOMAIN: {os.environ.get('CHATMAIL_DOMAIN')}"]
     for base in os.get_exec_path():
         fn = pathlib.Path(base).joinpath(base, "deltachat-rpc-server")
         if fn.exists():
             proc = subprocess.Popen([str(fn), "--version"], stderr=subprocess.PIPE)
             proc.wait()
             version = proc.stderr.read().decode().strip()
-            return f"deltachat-rpc-server: {fn} [{version}]"
+            headers.append(f"RPC-SERVER: {fn} [{version}]")
+            break
 
-    return None
+    return headers
 
 
 class ACFactory:
@@ -280,10 +306,16 @@ def alice_and_remote_bob(tmp_path, acfactory, get_core_python_env):
 
         accounts_dir = str(tmp_path.joinpath("account1_venv1"))
         channel = gw.remote_exec(remote_bob_loop)
-        cm = os.environ.get("CHATMAIL_DOMAIN")
+
+        # old cores need "ic=3" to accept
+        # the self-signed cert of an underscore domain
+        addr, password = acfactory.get_credentials()
+        dclogin_qr = f"dclogin://{urllib.parse.quote(addr, safe='@')}?p={urllib.parse.quote(password)}&v=1"
+        if os.environ["CHATMAIL_DOMAIN"].startswith("_"):
+            dclogin_qr += "&ic=3"
 
         # trigger getting an online account on bob's side
-        channel.send((accounts_dir, str(rpc_server_path), cm))
+        channel.send((accounts_dir, str(rpc_server_path), dclogin_qr))
 
         # meanwhile get a local alice account
         alice = acfactory.get_online_account()
@@ -315,10 +347,8 @@ def remote_bob_loop(channel):
     import os
 
     from deltachat_rpc_client import DeltaChat, Rpc
-    from deltachat_rpc_client.pytestplugin import ACFactory
 
-    accounts_dir, rpc_server_path, chatmail_domain = channel.receive()
-    os.environ["CHATMAIL_DOMAIN"] = chatmail_domain
+    accounts_dir, rpc_server_path, dclogin_qr = channel.receive()
 
     # older core versions don't support specifying rpc_server_path
     # so we can't just pass `rpc_server_path` argument to Rpc constructor
@@ -329,8 +359,13 @@ def remote_bob_loop(channel):
     with rpc:
         dc = DeltaChat(rpc)
         channel.send(dc.rpc.get_system_info()["deltachat_core_version"])
-        acfactory = ACFactory(dc)
-        bob = acfactory.get_online_account()
+
+        # ACFactory would configure from a "dcaccount" QR,
+        # which old cores cannot use on underscore domains
+        bob = dc.add_account()
+        bob.add_transport_from_qr(dclogin_qr)
+        bob.bring_online()
+
         alice_vcard = channel.receive()
         [alice_contact] = bob.import_vcard(alice_vcard)
         ns = {"bob": bob, "bob_contact_alice": alice_contact}
