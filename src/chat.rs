@@ -45,7 +45,7 @@ use crate::mimefactory;
 use crate::mimefactory::{MimeFactory, RenderedEmail};
 use crate::mimeparser::SystemMessage;
 use crate::param::{Param, Params};
-use crate::pgp::addresses_from_public_key;
+use crate::pgp::{addresses_from_public_key, encryption_kind};
 use crate::reaction::broadcast_reactions;
 use crate::receive_imf::ReceivedMsg;
 use crate::smtp::{self, send_msg_to_smtp};
@@ -1244,11 +1244,17 @@ SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
                 .context("Contact does not have a fingerprint in encrypted chat")?
                 .human_readable();
             if let Some(public_key) = contact.public_key(context).await? {
+                // Which subkey family (classic vs. post-quantum hybrid) would be used to
+                // encrypt to this member, shown so it's obvious at a glance in the
+                // "encryption info" screen without having to inspect the fingerprint.
+                let kind = encryption_kind(&public_key)
+                    .map(|k| format!(" [{}]", k.label()))
+                    .unwrap_or_default();
                 if let Some(relay_addrs) = addresses_from_public_key(&public_key) {
                     let relays = relay_addrs.join(",");
-                    ret += &format!("\n{addr}({relays})\n{fingerprint}\n");
+                    ret += &format!("\n{addr}({relays}){kind}\n{fingerprint}\n");
                 } else {
-                    ret += &format!("\n{addr}\n{fingerprint}\n");
+                    ret += &format!("\n{addr}{kind}\n{fingerprint}\n");
                 }
             } else {
                 ret += &format!("\n{addr}\n(key missing)\n{fingerprint}\n");

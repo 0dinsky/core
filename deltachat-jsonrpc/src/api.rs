@@ -22,6 +22,7 @@ use deltachat::contact::{Contact, ContactId, Origin, may_be_valid_addr};
 use deltachat::context::get_info;
 use deltachat::ephemeral::Timer;
 use deltachat::imex;
+use deltachat::key;
 use deltachat::location;
 use deltachat::message::{
     self, Message, MessageState, MsgId, Viewtype, delete_msgs_ext, get_existing_msg_ids,
@@ -1845,6 +1846,29 @@ impl CommandApi {
     ) -> Result<String> {
         let ctx = self.get_context(account_id).await?;
         Contact::get_encrinfo(&ctx, ContactId::new(contact_id)).await
+    }
+
+    /// Returns the encryption algorithm family of this account's current
+    /// encryption key: `"classic"` (ECDH/X25519), `"pq"` (post-quantum
+    /// ML-KEM-768+X25519 hybrid), or `""` if no key has been generated yet.
+    ///
+    /// This reflects the key that is actually in use right now, which may
+    /// briefly lag the `key_gen_mode` config value after it is changed —
+    /// call `rotate_keypair_now()` to apply a changed setting immediately.
+    async fn get_self_encryption_kind(&self, account_id: u32) -> Result<String> {
+        let ctx = self.get_context(account_id).await?;
+        key::get_self_encryption_kind(&ctx).await
+    }
+
+    /// Immediately generates a fresh encryption subkey matching the current
+    /// `key_gen_mode` config (classic or post-quantum) and makes it the
+    /// active self key. The primary key fingerprint is preserved, so
+    /// contacts do not need to re-verify — unless this rotation switches
+    /// the *primary* key's own family (classic ⇄ post-quantum), in which
+    /// case the fingerprint does change and re-verification is needed.
+    async fn rotate_keypair_now(&self, account_id: u32) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        key::rotate_keypair_now(&ctx).await
     }
 
     /// Looks up a known and unblocked contact with a given e-mail address.

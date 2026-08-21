@@ -35,7 +35,7 @@ use crate::log::{LogExt, warn};
 use crate::message::MessageState;
 use crate::mimeparser::AvatarAction;
 use crate::param::{Param, Params};
-use crate::pgp::{addresses_from_public_key, merge_openpgp_certificates};
+use crate::pgp::{addresses_from_public_key, encryption_kind, merge_openpgp_certificates};
 use crate::sync::{self, Sync::*};
 use crate::tools::{SystemTime, duration_to_str, get_abs_path, normalize_text, time, to_lowercase};
 use crate::{chat, chatlist_events, ensure_and_debug_assert_ne, stock_str};
@@ -1394,31 +1394,40 @@ WHERE addr=?
         };
         let fingerprint_other = fingerprint_other.human_readable();
 
-        let stock_message = if contact.public_key(context).await?.is_some() {
+        let contact_public_key = contact.public_key(context).await?;
+        let stock_message = if contact_public_key.is_some() {
             stock_str::messages_are_e2ee(context)
         } else {
             stock_str::encr_none(context)
         };
+        // Encryption family (classic vs. post-quantum hybrid) of the subkey that
+        // would actually be used to encrypt to each side, shown next to the
+        // fingerprint so it's visible right in the "encryption info" screen.
+        let encryption_kind_other = contact_public_key
+            .as_ref()
+            .and_then(encryption_kind)
+            .map(|k| k.label());
 
         let finger_prints = stock_str::finger_prints(context);
         let mut ret = format!("{stock_message}\n{finger_prints}:");
 
-        let fingerprint_self = load_self_public_key(context)
-            .await?
-            .dc_fingerprint()
-            .human_readable();
+        let self_public_key = load_self_public_key(context).await?;
+        let fingerprint_self = self_public_key.dc_fingerprint().human_readable();
+        let encryption_kind_self = encryption_kind(&self_public_key).map(|k| k.label());
         if addr < contact.addr {
             cat_fingerprint(
                 &mut ret,
                 &stock_str::self_msg(context),
                 &addr,
                 &fingerprint_self,
+                encryption_kind_self,
             );
             cat_fingerprint(
                 &mut ret,
                 contact.get_display_name(),
                 &contact.addr,
                 &fingerprint_other,
+                encryption_kind_other,
             );
         } else {
             cat_fingerprint(
@@ -1426,16 +1435,18 @@ WHERE addr=?
                 contact.get_display_name(),
                 &contact.addr,
                 &fingerprint_other,
+                encryption_kind_other,
             );
             cat_fingerprint(
                 &mut ret,
                 &stock_str::self_msg(context),
                 &addr,
                 &fingerprint_self,
+                encryption_kind_self,
             );
         }
 
-        if let Some(public_key) = contact.public_key(context).await?
+        if let Some(public_key) = contact_public_key
             && let Some(relay_addrs) = addresses_from_public_key(&public_key)
         {
             ret += "\n\nRelays:";
@@ -2062,8 +2073,17 @@ pub(crate) async fn mark_contact_id_as_verified(
     Ok(())
 }
 
-fn cat_fingerprint(ret: &mut String, name: &str, addr: &str, fingerprint: &str) {
-    *ret += &format!("\n\n{name} ({addr}):\n{fingerprint}");
+fn cat_fingerprint(
+    ret: &mut String,
+    name: &str,
+    addr: &str,
+    fingerprint: &str,
+    kind_label: Option<&'static str>,
+) {
+    match kind_label {
+        Some(kind) => *ret += &format!("\n\n{name} ({addr}) — {kind}:\n{fingerprint}"),
+        None => *ret += &format!("\n\n{name} ({addr}):\n{fingerprint}"),
+    }
 }
 
 fn split_address_book(book: &str) -> Vec<(&str, &str)> {

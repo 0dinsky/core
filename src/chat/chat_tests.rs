@@ -4390,7 +4390,7 @@ async fn test_chat_get_encryption_info() -> Result<()> {
         chat_id.get_encryption_info(alice).await?,
         "Messages are end-to-end encrypted.\n\
          \n\
-         bob@example.net(bob@example.net)\n\
+         bob@example.net(bob@example.net) [Classic (ECDH/X25519)]\n\
          CCCB 5AA9 F6E1 141C 9431\n\
          65F1 DB18 B18C BCF7 0487"
     );
@@ -4400,11 +4400,11 @@ async fn test_chat_get_encryption_info() -> Result<()> {
         chat_id.get_encryption_info(alice).await?,
         "Messages are end-to-end encrypted.\n\
          \n\
-         fiona@example.net(fiona@example.net)\n\
+         fiona@example.net(fiona@example.net) [Classic (ECDH/X25519)]\n\
          C8BA 50BF 4AC1 2FAF 38D7\n\
          F657 DDFC 8E9F 3C79 9195\n\
          \n\
-         bob@example.net(bob@example.net)\n\
+         bob@example.net(bob@example.net) [Classic (ECDH/X25519)]\n\
          CCCB 5AA9 F6E1 141C 9431\n\
          65F1 DB18 B18C BCF7 0487"
     );
