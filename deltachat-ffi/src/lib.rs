@@ -1099,7 +1099,7 @@ pub unsafe extern "C" fn dc_send_delete_request(
     let ctx = unsafe { &*context };
     let msg_ids = convert_and_prune_message_ids(msg_ids, msg_cnt);
 
-    block_on(message::delete_msgs_ex(ctx, &msg_ids, true))
+    block_on(message::delete_msgs_ext(ctx, &msg_ids, true))
         .context("failed dc_send_delete_request() call")
         .log_err(ctx)
         .ok();
@@ -1140,7 +1140,7 @@ pub unsafe extern "C" fn dc_get_webxdc_status_updates(
         MsgId::new(msg_id),
         StatusUpdateSerial::new(last_known_serial),
     ))
-    .unwrap_or_else(|_| "".to_string())
+    .unwrap_or_log_default(ctx, "Failed to get webxdc status updates")
     .strdup()
 }
 
@@ -1342,7 +1342,7 @@ pub unsafe extern "C" fn dc_get_chat_msgs(
 
     let add_daymarker = (flags & DC_GCM_ADDDAYMARKER) != 0;
     Box::into_raw(Box::new(
-        block_on(chat::get_chat_msgs_ex(
+        block_on(chat::get_chat_msgs_ext(
             ctx,
             ChatId::new(chat_id),
             MessageListOptions { add_daymarker },
@@ -2444,7 +2444,7 @@ pub unsafe extern "C" fn dc_get_securejoin_qr(
     };
 
     block_on(securejoin::get_securejoin_qr(ctx, chat_id))
-        .unwrap_or_else(|_| "".to_string())
+        .unwrap_or_log_default(ctx, "Failed to generate securejoin QR code")
         .strdup()
 }
 
@@ -2465,7 +2465,7 @@ pub unsafe extern "C" fn dc_get_securejoin_qr_svg(
     };
 
     block_on(get_securejoin_qr_svg(ctx, chat_id))
-        .unwrap_or_else(|_| "".to_string())
+        .unwrap_or_log_default(ctx, "Failed to generate securejoin QR code SVG")
         .strdup()
 }
 
@@ -3078,11 +3078,6 @@ pub unsafe extern "C" fn dc_chat_can_send(chat: *mut dc_chat_t) -> libc::c_int {
         .context("can_send failed")
         .log_err(&ffi_chat.context)
         .unwrap_or_default() as libc::c_int
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn dc_chat_is_protected(_chat: *mut dc_chat_t) -> libc::c_int {
-    0
 }
 
 #[unsafe(no_mangle)]

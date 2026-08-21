@@ -12,7 +12,7 @@ use deltachat::blob::BlobObject;
 use deltachat::calls::ice_servers;
 use deltachat::chat::{
     self, Chat, ChatId, ChatItem, MessageListOptions, add_contact_to_chat, forward_msgs,
-    forward_msgs_2ctx, get_chat_media, get_chat_msgs, get_chat_msgs_ex, markfresh_chat,
+    forward_msgs_2ctx, get_chat_media, get_chat_msgs, get_chat_msgs_ext, markfresh_chat,
     marknoticed_all_chats, marknoticed_chat, remove_contact_from_chat,
 };
 use deltachat::chatlist::Chatlist;
@@ -24,7 +24,7 @@ use deltachat::ephemeral::Timer;
 use deltachat::imex;
 use deltachat::location;
 use deltachat::message::{
-    self, Message, MessageState, MsgId, Viewtype, delete_msgs_ex, get_existing_msg_ids,
+    self, Message, MessageState, MsgId, Viewtype, delete_msgs_ext, get_existing_msg_ids,
     get_msg_read_receipt_count, get_msg_read_receipts, markseen_msgs,
 };
 use deltachat::peer_channels::{
@@ -64,6 +64,7 @@ use self::types::{
         JsonrpcMessageListItem, MessageNotificationInfo, MessageSearchResult, MessageViewtype,
     },
 };
+use crate::api::types::appversions::JsonrpcAppSource;
 use crate::api::types::chat_list::{ChatListItemFetchResult, get_chat_list_item_by_id};
 use crate::api::types::login_param::TransportListEntry;
 use crate::api::types::qr::{QrObject, SecurejoinSource, SecurejoinUiPath};
@@ -935,7 +936,6 @@ impl CommandApi {
     ///     to `check_qr()`.
     ///
     /// **returns**: The chat ID of the joined chat, the UI may redirect to the this chat.
-    ///         A returned chat ID does not guarantee that the chat is protected or the belonging contact is verified.
     ///
     async fn secure_join(&self, account_id: u32, qr: String) -> Result<u32> {
         let ctx = self.get_context(account_id).await?;
@@ -1406,7 +1406,7 @@ impl CommandApi {
         add_daymarker: bool,
     ) -> Result<Vec<u32>> {
         let ctx = self.get_context(account_id).await?;
-        let msg = get_chat_msgs_ex(
+        let msg = get_chat_msgs_ext(
             &ctx,
             ChatId::new(chat_id),
             MessageListOptions { add_daymarker },
@@ -1455,7 +1455,7 @@ impl CommandApi {
         add_daymarker: bool,
     ) -> Result<Vec<JsonrpcMessageListItem>> {
         let ctx = self.get_context(account_id).await?;
-        let msg = get_chat_msgs_ex(
+        let msg = get_chat_msgs_ext(
             &ctx,
             ChatId::new(chat_id),
             MessageListOptions { add_daymarker },
@@ -1546,7 +1546,7 @@ impl CommandApi {
     async fn delete_messages(&self, account_id: u32, message_ids: Vec<u32>) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
         let msgs: Vec<MsgId> = message_ids.into_iter().map(MsgId::new).collect();
-        delete_msgs_ex(&ctx, &msgs, false).await
+        delete_msgs_ext(&ctx, &msgs, false).await
     }
 
     /// Delete messages. The messages are deleted on the current device,
@@ -1554,7 +1554,7 @@ impl CommandApi {
     async fn delete_messages_for_all(&self, account_id: u32, message_ids: Vec<u32>) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
         let msgs: Vec<MsgId> = message_ids.into_iter().map(MsgId::new).collect();
-        delete_msgs_ex(&ctx, &msgs, true).await
+        delete_msgs_ext(&ctx, &msgs, true).await
     }
 
     /// Get an informational text for a single message. The text is multiline and may
@@ -2801,6 +2801,39 @@ impl CommandApi {
         } else {
             Err(anyhow!("chat with id {chat_id} doesn't have draft message"))
         }
+    }
+
+    /// Get version information of a specific client and source
+    /// across all configured accounts and transports.
+    ///
+    /// Returns the source with the highest `version_integer`.
+    /// If no matching version information is available at all, `None` is returned.
+    ///
+    /// UIs shall call the function after a reasonable time after app start,
+    /// when most relays have reported the information they have, say 30 seconds.
+    /// After that, once a day.
+    /// (it is accepted if by the simple approach an update message is delayed.
+    /// an event was considered, but that seemed more complex for few benefit:
+    /// as we do not know if "late" relays will report "better" versions,
+    /// also there we would work with timeouts etc.)
+    ///
+    /// If the reported `version_integer` is larger than the running app version,
+    /// the UI shall report to the user, that an update is available,
+    /// and, if possible, offer a direct update by the given URL.
+    ///
+    /// Security note: consumers need to verify themselves
+    /// that downloaded app files are valid before installing them.
+    async fn get_app_version(
+        &self,
+        client_id: String,
+        source_id: String,
+    ) -> Result<Option<JsonrpcAppSource>> {
+        let accounts = self.accounts.read().await;
+        Ok(
+            deltachat::appversions::get_app_version(&accounts, &client_id, &source_id)
+                .await?
+                .map(JsonrpcAppSource::from_core_type),
+        )
     }
 }
 

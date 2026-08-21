@@ -7,6 +7,7 @@ import imaplib
 import io
 import pathlib
 import ssl
+import time
 from contextlib import contextmanager
 from typing import List, TYPE_CHECKING
 
@@ -42,10 +43,22 @@ class DirectImap:
         host = user.rsplit("@")[-1]
         pw = self.account.get_config("mail_pw")
 
-        self.conn = MailBox(host, port, ssl_context=ssl.create_default_context())
-        self.conn.login(user, pw)
+        ssl_context = ssl.create_default_context()
+        if host.startswith("_"):
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
 
-        self.select_folder("INBOX")
+        while True:
+            try:
+                self.conn = MailBox(host, port, ssl_context=ssl_context)
+                self.conn.login(user, pw)
+                self.select_folder("INBOX")
+                return
+            except (OSError, imaplib.IMAP4.abort) as e:
+                # OSError covers ssl.SSLError, "abort" is a dropped connection;
+                # permanent IMAP errors (login rejected etc) must not be retried.
+                print(f"direct_imap connect to {host} failed ({e!r}), retrying")
+                time.sleep(1)
 
     def shutdown(self):
         try:

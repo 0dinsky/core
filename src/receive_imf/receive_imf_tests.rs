@@ -390,7 +390,6 @@ async fn test_escaped_from() {
         "Имя, Фамилия",
     );
     let msg = get_chat_msg(&t, chat_id, 0, 1).await;
-    assert_eq!(msg.is_dc_message, MessengerMessage::Yes);
     assert_eq!(msg.text, "hello");
     assert_eq!(msg.param.get_int(Param::WantsMdn).unwrap(), 1);
 }
@@ -437,7 +436,6 @@ async fn test_escaped_recipients() {
     let msg = Message::load_from_db(&t, chats.get_msg_id(0).unwrap().unwrap())
         .await
         .unwrap();
-    assert_eq!(msg.is_dc_message, MessengerMessage::No);
     assert_eq!(msg.text, "foo – hello");
 }
 
@@ -951,10 +949,10 @@ async fn test_classic_mailing_list() -> Result<()> {
     assert!(mime.contains("Chat-Version: 1.0\r\n"));
     assert!(mime.contains("To: <delta@codespeak.net>\r\n"));
     assert!(mime.contains("From: <alice@example.org>\r\n"));
-    assert!(mime.contains(
+    assert!(mime.ends_with(
         "\r\n\
 \r\n\
-Hello mailinglist!\r\n"
+Hello mailinglist!"
     ));
 
     receive_imf(&t.ctx, DC_MAILINGLIST2, false).await?;

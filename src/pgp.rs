@@ -1078,15 +1078,19 @@ mod tests {
             salt: [1; 8],
         };
 
-        test_dont_decrypt_expensive_message_ex(s2k, false, None).await
+        test_dont_decrypt_expensive_message_ext(s2k, false, None).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_dont_decrypt_expensive_message_bad_s2k() -> Result<()> {
         let s2k = StringToKey::new_default(&mut thread_rng()); // Default is IteratedAndSalted
 
-        test_dont_decrypt_expensive_message_ex(s2k, false, Some("unsupported string2key algorithm"))
-            .await
+        test_dont_decrypt_expensive_message_ext(
+            s2k,
+            false,
+            Some("unsupported string2key algorithm"),
+        )
+        .await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1098,7 +1102,7 @@ mod tests {
 
         // This error message is actually not great,
         // but grepping for it will lead to the correct code
-        test_dont_decrypt_expensive_message_ex(s2k, true, Some("decrypt_the_ring: missing key"))
+        test_dont_decrypt_expensive_message_ext(s2k, true, Some("decrypt_the_ring: missing key"))
             .await
     }
 
@@ -1107,7 +1111,7 @@ mod tests {
     /// with an expensive string2key algorithm
     /// or multiple shared secrets.
     /// This is to prevent possible DOS attacks on the app.
-    async fn test_dont_decrypt_expensive_message_ex(
+    async fn test_dont_decrypt_expensive_message_ext(
         s2k: StringToKey,
         encrypt_twice: bool,
         expected_error_msg: Option<&str>,

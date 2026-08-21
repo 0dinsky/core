@@ -2639,7 +2639,6 @@ char*           dc_get_securejoin_qr_svg         (dc_context_t* context, uint32_
  *     to dc_check_qr().
  * @return The chat ID of the joined chat, the UI may redirect to the this chat.
  *     On errors, 0 is returned, however, most errors will happen during handshake later on.
- *     A returned chat ID does not guarantee that the chat is protected or the belonging contact is verified.
  */
 uint32_t        dc_join_securejoin           (dc_context_t* context, const char* qr);
 
@@ -3571,6 +3570,8 @@ dc_lot_t*        dc_chatlist_get_summary2    (dc_context_t* context, uint32_t ch
 /**
  * Get info summary for a chat, in JSON format.
  *
+ * @deprecated 2026-08-13, use dedicated dc_chat_get_*() getters or jsonrpc
+ *
  * The returned JSON string has the following key/values:
  *
  * id: chat id
@@ -3788,17 +3789,6 @@ int             dc_chat_is_device_talk       (const dc_chat_t* chat);
  * @return 1=chat is writable, 0=chat is not writable.
  */
 int             dc_chat_can_send              (const dc_chat_t* chat);
-
-
-/**
- * Deprecated, always returns 0.
- *
- * @memberof dc_chat_t
- * @param chat The chat object.
- * @return Always 0.
- * @deprecated 2025-09-09
- */
-int             dc_chat_is_protected         (const dc_chat_t* chat);
 
 
 /**
@@ -7183,6 +7173,30 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// `%1$s` will be replaced by name of the removed contact.
 #define DC_STR_REMOVE_MEMBER 178
+
+/// "You were removed by %1$s."
+///
+/// `%1$s` will be replaced by name of the contact who did the action.
+///
+/// Used in status messages.
+#define DC_STR_REMOVE_YOU_BY 179
+
+/// "You were added by %1$s."
+///
+/// `%1$s` will be replaced by name of the contact who did the action.
+///
+/// Used in status messages.
+#define DC_STR_ADD_YOU_BY 180
+
+/// "You were removed."
+///
+/// Used in status messages.
+#define DC_STR_REMOVE_YOU 181
+
+/// "You were added."
+///
+/// Used in status messages.
+#define DC_STR_ADD_YOU 182
 
 /// "Establishing connection, please wait…"
 ///

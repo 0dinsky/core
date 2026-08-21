@@ -341,7 +341,7 @@ impl Context {
         // Since there was a sync message, we know that there is a second device.
         // Set BccSelf to true if it isn't already.
         if !items.items.is_empty() && !self.get_config_bool(Config::BccSelf).await.unwrap_or(true) {
-            self.set_config_ex(Sync::Nosync, Config::BccSelf, Some("1"))
+            self.set_config_ext(Sync::Nosync, Config::BccSelf, Some("1"))
                 .await
                 .log_err(self)
                 .ok();
@@ -810,7 +810,7 @@ mod tests {
         let fiona = &tcm.fiona().await;
         tcm.exec_securejoin_qr(fiona, alice2, &qr).await;
         let msg = fiona.get_last_msg().await;
-        assert_eq!(msg.text, "Member Me added by alice@example.org.");
+        assert_eq!(msg.text, "You were added by alice@example.org.");
         Ok(())
     }
 
